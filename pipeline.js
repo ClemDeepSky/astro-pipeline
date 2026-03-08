@@ -723,7 +723,7 @@ function runDrizzle(filter) {
 
 function main() {
   ensureDir(CONFIG.resultDir);
-  writeStatus("INIT", "STARTED", { version: "1.0.0", config: CONFIG });
+  writeStatus("INIT", "STARTED", { version: "1.1.0", config: CONFIG });
 
   // ---- Détection des filtres ----
   var filters = CONFIG.filters || detectFilters();
@@ -832,7 +832,7 @@ function main() {
 
   // ---- Rapport final ----
   var report = {
-    version:   "1.0.0",
+    version:   "1.1.0",
     completed: (new Date()).toISOString(),
     rootDir:   CONFIG.rootDir,
     filters:   filters,
