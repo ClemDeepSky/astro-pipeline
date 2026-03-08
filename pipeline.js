@@ -1,6 +1,6 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.0.0
+// Version: 1.1.0
 // ============================================================
 //
 // USAGE: Ouvrir PixInsight > Script > Run Script > pipeline.js
@@ -198,44 +198,55 @@ function findDOFMasters(filter, temp, expTime) {
   var tempRounded = Math.round(temp);
   var expInt = Math.round(expTime);
 
-  // SuperBias
-  var biasFiles = searchRecursive(CONFIG.dofDir, "SuperBias*.xisf");
+  // Chercher dans les sous-dossiers standard MasterBias/MasterDarks/MasterFlats
+  // (fallback sur searchRecursive si ces dossiers n'existent pas)
+  var biasDir = CONFIG.dofDir + "/MasterBias";
+  var darkDir = CONFIG.dofDir + "/MasterDarks";
+  var flatDir = CONFIG.dofDir + "/MasterFlats";
+
+  var biasFiles = File.directoryExists(biasDir) ? findFiles(biasDir, "*.xisf")
+                : searchRecursive(CONFIG.dofDir, "*SuperBias*.xisf");
+  var darkFiles = File.directoryExists(darkDir) ? findFiles(darkDir, "*.xisf")
+                : searchRecursive(CONFIG.dofDir, "*Dark*.xisf");
+  var flatFiles = File.directoryExists(flatDir) ? findFiles(flatDir, "*.xisf")
+                : searchRecursive(CONFIG.dofDir, "*Flat_" + filter + "*.xisf");
+
+  // SuperBias: filtrer par temp (-tempRounded- ou -tempRounded. ou -abs(temp))
   var biasByTemp = biasFiles.filter(function(f) {
-    return f.indexOf("-" + tempRounded + ".") >= 0 ||
-           f.indexOf("-" + tempRounded + "_") >= 0;
+    return f.indexOf("-" + tempRounded + "-") >= 0 ||
+           f.indexOf("-" + tempRounded + ".") >= 0 ||
+           f.indexOf("-" + Math.abs(tempRounded) + ".") >= 0;
   });
-  if (biasByTemp.length > 0) {
-    dof.bias = biasByTemp[0];
-  } else if (biasFiles.length > 0) {
-    // Fallback: take first SuperBias found
-    dof.bias = biasFiles[0];
+  dof.bias = (biasByTemp.length > 0) ? biasByTemp[0]
+           : (biasFiles.length > 0 ? biasFiles[0] : null);
+
+  // Dark: filtrer par exposition + temp
+  var darkByExpTemp = darkFiles.filter(function(f) {
+    return f.indexOf("-" + expInt + "-" + tempRounded) >= 0 ||
+           f.indexOf("-" + expInt + "-" + Math.abs(tempRounded)) >= 0;
+  });
+  if (darkByExpTemp.length > 0) {
+    dof.dark = darkByExpTemp[0];
+  } else {
+    var darkByExp = darkFiles.filter(function(f) { return f.indexOf("-" + expInt + "-") >= 0; });
+    dof.dark = (darkByExp.length > 0) ? darkByExp[0]
+             : (darkFiles.length > 0 ? darkFiles[0] : null);
   }
 
-  // Dark
-  var darkFiles = searchRecursive(CONFIG.dofDir, "Dark*.xisf");
-  var darkPatterns = [
-    "Dark-" + expInt + "-" + tempRounded,
-    "Dark-" + expInt + "-0",
-    "Dark-" + expInt,
-  ];
-  for (var dp = 0; dp < darkPatterns.length; dp++) {
-    for (var df = 0; df < darkFiles.length; df++) {
-      if (darkFiles[df].indexOf(darkPatterns[dp]) >= 0) {
-        dof.dark = darkFiles[df];
-        break;
-      }
-    }
-    if (dof.dark) break;
+  // Flat: filtrer par filtre (_Filter_ ou _Filter-)
+  var flatByFilter = flatFiles.filter(function(f) {
+    return f.indexOf("_" + filter + "_") >= 0 || f.indexOf("_" + filter + "-") >= 0;
+  });
+  if (flatByFilter.length > 0) {
+    var flatByFilterTemp = flatByFilter.filter(function(f) {
+      return f.indexOf("-" + Math.abs(tempRounded) + ".") >= 0 ||
+             f.indexOf("-" + Math.abs(tempRounded) + "-") >= 0;
+    });
+    dof.flat = (flatByFilterTemp.length > 0) ? flatByFilterTemp[0] : flatByFilter[0];
   }
 
-  // Flat
-  var flatFiles = searchRecursive(CONFIG.dofDir, "Flat_" + filter + "_ARO*.xisf");
-  if (flatFiles.length === 0) {
-    flatFiles = searchRecursive(CONFIG.dofDir, "Flat_" + filter + "*.xisf");
-  }
-  if (flatFiles.length > 0) dof.flat = flatFiles[0];
-
-  console.writeln("  DOF " + filter + ": bias=" + (dof.bias ? File.extractName(dof.bias) : "NONE") +
+  console.writeln("  DOF " + filter + " (T=" + tempRounded + "°C Exp=" + expInt + "s):" +
+    " bias=" + (dof.bias ? File.extractName(dof.bias) : "NONE") +
     " | dark=" + (dof.dark ? File.extractName(dof.dark) : "NONE") +
     " | flat=" + (dof.flat ? File.extractName(dof.flat) : "NONE"));
 
@@ -251,29 +262,19 @@ function runCalibration(filter) {
   var calDir = srcDir + "/calibrated";
   ensureDir(calDir);
 
-  // Chercher les bruts (pas déjà calibrés)
+  // FIX v1.1: scanner /* puis filtrer par extension (plus fiable que *.fits)
   var rawFiles = [];
-  var exts = ["*.fit", "*.fits", "*.FIT", "*.FITS"];
-  for (var e = 0; e < exts.length; e++) {
-    var ff = new FileFind();
-    if (ff.begin(srcDir + "/" + exts[e])) {
-      do {
-        if (ff.name !== "." && ff.name !== ".." &&
+  var ff = new FileFind();
+  if (ff.begin(srcDir + "/*")) {
+    do {
+      if (ff.name !== "." && ff.name !== "..") {
+        var ext = File.extractExtension(ff.name).toLowerCase();
+        if ((ext===".fit" || ext===".fits" || ext===".xisf") &&
             ff.name.indexOf("_c.") < 0 && ff.name.indexOf("_c_") < 0) {
           rawFiles.push(srcDir + "/" + ff.name);
         }
-      } while (ff.next());
-    }
-  }
-  // Also check .xisf raws
-  var ff2 = new FileFind();
-  if (ff2.begin(srcDir + "/*.xisf")) {
-    do {
-      if (ff2.name !== "." && ff2.name !== ".." &&
-          ff2.name.indexOf("_c.") < 0 && ff2.name.indexOf("_c_") < 0) {
-        rawFiles.push(srcDir + "/" + ff2.name);
       }
-    } while (ff2.next());
+    } while (ff.next());
   }
   rawFiles.sort();
 
@@ -295,7 +296,8 @@ function runCalibration(filter) {
   var dof = findDOFMasters(filter, temp, expTime);
 
   var ic = new ImageCalibration();
-  ic.inputFiles = rawFiles;
+  // FIX v1.1: targetFrames [[enabled, path], ...] requis (inputFiles ne fonctionne pas)
+  ic.targetFrames = rawFiles.map(function(f) { return [true, f]; });
   ic.outputDirectory = calDir;
   ic.outputExtension = ".xisf";
   ic.outputPostfix = "_c";
