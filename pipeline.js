@@ -1,6 +1,6 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.1.0
+// Version: 1.2.0
 // ============================================================
 //
 // USAGE: Ouvrir PixInsight > Script > Run Script > pipeline.js
@@ -37,13 +37,13 @@ var CONFIG = {
   drizzleScale:      2.0,
   drizzleDropShrink: 0.90,
 
-  // SubframeSelector - seuils automatiques (percentiles)
-  // Stars  : rejette en dessous de P_stars  (ex: P10 = rejette les 10% moins étoilées)
-  // FWHM   : rejette au dessus de P_fwhm   (ex: P90 = rejette les 10% plus floues)
-  // SNRWeight: rejette en dessous de P_snr (ex: P10 = rejette les 10% plus bruitées)
-  pStars:            10,
-  pFWHM:             90,
-  pSNR:              10,
+  // SubframeSelector - sélection robuste par score global (MAD + IQR)
+  // Poids des pénalités de dégradation par critère :
+  wSNR:              1.0,   // SNR (plus élevé = meilleure image)
+  wFWHM:             1.2,   // FWHM surpondérée (impact résolution)
+  wStars:            1.0,   // Nombre d'étoiles
+  // Seuil de rejet : Q3 + iqrMult * IQR sur la distribution des scores
+  iqrMult:           1.5,
 
   // Subframe scale (arcsec/px - dépend de la caméra/optique)
   subframeScale:     2.26,
@@ -462,24 +462,91 @@ function runSubframeAndSSWEIGHT(filter) {
     return [];
   }
 
-  // --- Auto-seuils percentiles ---
-  var fwhmThresh  = percentile(fwhmArr,  CONFIG.pFWHM);
-  var snrThresh   = percentile(snrArr,   CONFIG.pSNR);
-  var starsThresh = percentile(starsArr, CONFIG.pStars);
+  // --- Algorithme MAD + IQR : sélection robuste ---
 
-  console.writeln("  [" + filter + "] Auto-seuils: FWHM<=" + fwhmThresh.toFixed(2) +
-    "\" | SNR>=" + snrThresh.toFixed(2) + " | Stars>=" + Math.round(starsThresh));
+  // Étape 1 : médiane de chaque critère
+  var medSNR   = percentile(snrArr,   50);
+  var medFWHM  = percentile(fwhmArr,  50);
+  var medStars = percentile(starsArr, 50);
+
+  // Étape 2 : MAD (Median Absolute Deviation) — dispersion robuste
+  var madFn = function(arr, med) {
+    var devs = [];
+    for (var d = 0; d < arr.length; d++) devs.push(Math.abs(arr[d] - med));
+    return percentile(devs, 50);
+  };
+  var dispSNR   = Math.max(madFn(snrArr,   medSNR),   1e-6);
+  var dispFWHM  = Math.max(madFn(fwhmArr,  medFWHM),  1e-6);
+  var dispStars = Math.max(madFn(starsArr, medStars),  1e-6);
+
+  console.writeln("  [" + filter + "] Médiane: FWHM=" + medFWHM.toFixed(2) +
+    "\" SNR=" + medSNR.toFixed(2) + " Stars=" + Math.round(medStars));
+  console.writeln("  [" + filter + "] MAD:     FWHM=" + dispFWHM.toFixed(2) +
+    "\" SNR=" + dispSNR.toFixed(2) + " Stars=" + Math.round(dispStars));
   console.writeln("  [" + filter + "] Métriques: FWHM[" +
     Math.min.apply(null,fwhmArr).toFixed(2) + "-" + Math.max.apply(null,fwhmArr).toFixed(2) + "] | SNR[" +
     Math.min.apply(null,snrArr).toFixed(2) + "-" + Math.max.apply(null,snrArr).toFixed(2) + "] | Stars[" +
     Math.round(Math.min.apply(null,starsArr)) + "-" + Math.round(Math.max.apply(null,starsArr)) + "]");
 
-  // --- Approbation ---
-  var approved = data.filter(function(d) {
-    return d.fwhm <= fwhmThresh && d.snr >= snrThresh && d.stars >= starsThresh;
-  });
+  // Étape 3 : z-scores de dégradation (>0 uniquement si l'image est pire que la médiane)
+  //   z_SNR   : élevé si SNR est sous la médiane  → mauvais signal
+  //   z_FWHM  : élevé si FWHM est au-dessus       → étoiles plus grosses / turb.
+  //   z_Stars : élevé si Stars est sous la médiane → champ moins peuplé / nuages
+  for (var i = 0; i < data.length; i++) {
+    var d = data[i];
+    d.zSNR   = Math.max(0, (medSNR   - d.snr)   / dispSNR);
+    d.zFWHM  = Math.max(0, (d.fwhm   - medFWHM) / dispFWHM);
+    d.zStars = Math.max(0, (medStars  - d.stars) / dispStars);
+  }
+
+  // Étape 4 : score global avec bonus de cumulation
+  //   bonus +1 si ≥2 critères dégradés (z>1), +1 supplémentaire si les 3 le sont
+  var scoreArr = [];
+  for (var i = 0; i < data.length; i++) {
+    var d = data[i];
+    var nbDeg = (d.zSNR > 1 ? 1 : 0) + (d.zFWHM > 1 ? 1 : 0) + (d.zStars > 1 ? 1 : 0);
+    d.bonus = (nbDeg >= 2 ? 1 : 0) + (nbDeg >= 3 ? 1 : 0);
+    d.score = CONFIG.wSNR * d.zSNR + CONFIG.wFWHM * d.zFWHM + CONFIG.wStars * d.zStars + d.bonus;
+    scoreArr.push(d.score);
+  }
+
+  // Étape 5 : seuil IQR — seules les images statistiquement aberrantes sont rejetées
+  var Q1        = percentile(scoreArr, 25);
+  var Q3        = percentile(scoreArr, 75);
+  var IQR       = Q3 - Q1;
+  var threshold = Q3 + CONFIG.iqrMult * IQR;
+
+  console.writeln("  [" + filter + "] Score IQR: Q1=" + Q1.toFixed(3) +
+    " Q3=" + Q3.toFixed(3) + " IQR=" + IQR.toFixed(3) +
+    " → seuil=" + threshold.toFixed(3));
+
+  // Étape 6 : approbation + log des raisons de rejet
+  var approved = [];
+  var rejectionLog = [];
+  for (var i = 0; i < data.length; i++) {
+    var d = data[i];
+    if (d.score <= threshold) {
+      approved.push(d);
+    } else {
+      var reasons = [];
+      if (d.zSNR   > 0) reasons.push("SNR="   + d.snr.toFixed(2)   + " (z=" + d.zSNR.toFixed(2)   + ")");
+      if (d.zFWHM  > 0) reasons.push("FWHM="  + d.fwhm.toFixed(2)  + "\" (z=" + d.zFWHM.toFixed(2)  + ")");
+      if (d.zStars > 0) reasons.push("Stars=" + Math.round(d.stars) + " (z=" + d.zStars.toFixed(2) + ")");
+      rejectionLog.push({ file: File.extractName(d.path), score: d.score.toFixed(3), reasons: reasons });
+    }
+  }
+
   var rejected = data.length - approved.length;
-  console.writeln("  [" + filter + "] Approuvés: " + approved.length + "/" + data.length + " (rejetés: " + rejected + ")");
+  console.writeln("  [" + filter + "] Approuvés: " + approved.length + "/" + data.length +
+    " (rejetés: " + rejected + ", seuil score=" + threshold.toFixed(3) + ")");
+
+  if (rejectionLog.length > 0) {
+    console.writeln("  [" + filter + "] Images rejetées :");
+    for (var r = 0; r < rejectionLog.length; r++) {
+      var rl = rejectionLog[r];
+      console.writeln("    score=" + rl.score + " " + rl.file + " | " + rl.reasons.join(", "));
+    }
+  }
 
   if (approved.length === 0) {
     console.writeln("  [" + filter + "] ERREUR: aucun fichier approuvé - vérifier les paramètres");
@@ -544,13 +611,16 @@ function runSubframeAndSSWEIGHT(filter) {
     filter: filter,
     path: bestPath,
     ssw: bestSSW,
-    thresholds: { fwhmMax: fwhmThresh, snrMin: snrThresh, starsMin: starsThresh },
+    algorithm: "MAD+IQR",
+    thresholds: { scoreMax: threshold, Q1: Q1, Q3: Q3, IQR: IQR },
     stats: {
       total: data.length, approved: approved.length, rejected: rejected,
-      fwhm: { min: Math.min.apply(null,fwhmArr), max: Math.max.apply(null,fwhmArr) },
-      snr:  { min: Math.min.apply(null,snrArr),  max: Math.max.apply(null,snrArr)  },
-      stars:{ min: Math.round(Math.min.apply(null,starsArr)), max: Math.round(Math.max.apply(null,starsArr)) }
-    }
+      fwhm:  { min: Math.min.apply(null,fwhmArr),  max: Math.max.apply(null,fwhmArr),  med: medFWHM,  mad: dispFWHM  },
+      snr:   { min: Math.min.apply(null,snrArr),   max: Math.max.apply(null,snrArr),   med: medSNR,   mad: dispSNR   },
+      stars: { min: Math.round(Math.min.apply(null,starsArr)), max: Math.round(Math.max.apply(null,starsArr)),
+               med: Math.round(medStars), mad: Math.round(dispStars) }
+    },
+    rejectionLog: rejectionLog
   };
   writeJSON(CONFIG.resultDir + "/best_" + filter + ".json", bestInfo);
 
