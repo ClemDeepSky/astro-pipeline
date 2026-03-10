@@ -14,11 +14,12 @@
 // ============================================================
 
 var CONFIG = {
-  rootDir:           "D:/Gost",
+  rootDir:           "C:/LDN 1320",
   dofDir:            "D:/Terrapixa Dropbox/clement ver eecke/ARO/PIX",
-  resultDir:         "D:/Gost/result",
+  resultDir:         "C:/LDN 1320/result",
 
   // Filtres à traiter (null = auto-détection depuis les sous-dossiers)
+  // B:37  R:36  V:36 (V contient fichiers LIGHT_G → flat G via alias V→G)
   filters:           null,
 
   // Activation des phases
@@ -38,14 +39,12 @@ var CONFIG = {
   drizzleDropShrink: 0.90,
 
   // SubframeSelector - sélection robuste par score global (MAD + IQR)
-  // Poids des pénalités de dégradation par critère :
   wSNR:              1.0,   // SNR (plus élevé = meilleure image)
   wFWHM:             1.2,   // FWHM surpondérée (impact résolution)
   wStars:            1.0,   // Nombre d'étoiles
-  // Seuil de rejet : Q3 + iqrMult * IQR sur la distribution des scores
-  iqrMult:           1.5,
+  iqrMult:           1.5,   // Seuil rejet : Q3 + iqrMult * IQR
 
-  // Subframe scale (arcsec/px - dépend de la caméra/optique)
+  // Subframe scale (arcsec/px - ARO)
   subframeScale:     2.26,
 
   // Filtre préféré pour la référence StarAlignment
