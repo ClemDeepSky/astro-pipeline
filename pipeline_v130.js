@@ -1,10 +1,18 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.3.0
+// Version: 1.4.0
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.4.0 vs v1.3.0 :
+//   - Auto-optimisation sigma (coordinate descent + minimisation MAD)
+//   - probeIntegration() : intégrations légères sans écriture disque
+//   - findOptimalSigma() : balayage sigmaHigh puis sigmaLow, argmin MAD
+//   - Sauvegarde rejection maps (high + low) de l'intégration finale
+//   - {filter}_sigma_search.json : courbe sweep + sigma optimal
+//   - CONFIG.autoSigma : true/false (false = comportement identique v1.3.0)
 //
 // Nouveautés v1.3.0 vs v1.2.1 :
 //   - Critère Noise (fond de ciel) dans le score MAD+IQR
@@ -38,6 +46,12 @@ var CONFIG = {
   // ImageIntegration - SigmaClip
   sigmaLow:          4.0,
   sigmaHigh:         3.0,
+
+  // Auto-optimisation sigma (coordinate descent + minimisation MAD)
+  // false = valeurs sigmaLow/sigmaHigh fixes ci-dessus (comportement v1.3.0)
+  autoSigma:           true,
+  autoSigmaHighRange:  [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+  autoSigmaLowRange:   [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5],
 
   // DrizzleIntegration
   drizzleScale:      2.0,
@@ -916,11 +930,222 @@ function runStarAlignment(allApprovedFiles, referenceFile) {
 }
 
 // ============================================================
+// AUTO-SIGMA : probeIntegration + findOptimalSigma
+// ============================================================
+
+// Exécute une intégration légère sans écriture disque, sans drizzle.
+// Retourne { mad, rejRateHigh, rejRateLow }.
+// Utilisé uniquement pour le balayage sigma — aucun fichier produit.
+function probeIntegration(images, sigmaLow, sigmaHigh) {
+  var result = { mad: 999999, rejRateHigh: 0, rejRateLow: 0 };
+  if (images.length === 0) return result;
+
+  // Tableau probe sans chemin drizzle (generateDrizzleData=false)
+  var probeImages = [];
+  for (var pi = 0; pi < images.length; pi++) {
+    probeImages.push([images[pi][0], images[pi][1], "", ""]);
+  }
+
+  var ii = new ImageIntegration();
+  ii.images                 = probeImages;
+  ii.combination            = ImageIntegration.prototype.Average;
+  ii.weightMode             = ImageIntegration.prototype.KeywordWeight;
+  ii.weightKeyword          = "SSWEIGHT";
+  ii.weightScale            = ImageIntegration.prototype.WeightScale_BWMV;
+  ii.minWeight              = 0.005;
+  ii.normalization          = ImageIntegration.prototype.AdditiveWithScaling;
+  ii.rejection              = ImageIntegration.prototype.SigmaClip;
+  ii.rejectionNormalization = ImageIntegration.prototype.Scale;
+  ii.sigmaLow               = sigmaLow;
+  ii.sigmaHigh              = sigmaHigh;
+  ii.clipLow                = true;
+  ii.clipHigh               = true;
+  ii.generateDrizzleData    = false;  // pas de drizzle pour les probes
+  ii.generateIntegratedImage = true;
+  ii.generateRejectionMaps  = true;   // pour lire les taux de rejet
+
+  ii.executeGlobal();
+
+  // Récolte des fenêtres — ordre impératif : rejected_* AVANT integration
+  // (car "integration_rejected_high" contient aussi "integration")
+  var wins = ImageWindow.windows;
+  var intWin  = null;
+  var highWin = null;
+  var lowWin  = null;
+
+  for (var w = 0; w < wins.length; w++) {
+    var vid = wins[w].mainView.id.toLowerCase();
+    if (vid.indexOf("rejected_high") >= 0) { highWin = wins[w]; continue; }
+    if (vid.indexOf("rejected_low")  >= 0) { lowWin  = wins[w]; continue; }
+    if (vid.indexOf("integration")   >= 0) { intWin  = wins[w]; continue; }
+  }
+
+  // MAD du stack (channel 0 — représentatif pour L et RGB)
+  if (intWin !== null) {
+    try { result.mad = intWin.mainView.image.MAD(0); }
+    catch(e) { result.mad = 999999; }
+  }
+
+  // Taux de rejet : mean d'une rejection map binaire (0=conservé, 1=rejeté)
+  // mean(0) = fraction des pixels ayant subi au moins un rejet
+  if (highWin !== null) {
+    try { result.rejRateHigh = highWin.mainView.image.mean(0); }
+    catch(e) { result.rejRateHigh = 0; }
+  }
+  if (lowWin !== null) {
+    try { result.rejRateLow = lowWin.mainView.image.mean(0); }
+    catch(e) { result.rejRateLow = 0; }
+  }
+
+  closeAllWindows();  // tout fermer, aucune sauvegarde
+  return result;
+}
+
+// Recherche par descente de coordonnées les sigma optimaux minimisant le MAD.
+// Phase A : balaye autoSigmaHighRange (sigmaLow fixe au milieu de la plage low)
+// Phase B : balaye autoSigmaLowRange  (sigmaHigh fixe = meilleur de la Phase A)
+// Retourne { sigmaLow, sigmaHigh, sweepHigh, sweepLow }
+function findOptimalSigma(filter, images) {
+  var highRange = CONFIG.autoSigmaHighRange;
+  var lowRange  = CONFIG.autoSigmaLowRange;
+
+  // Guard : plages vides → fallback sur valeurs fixes
+  if (!highRange || highRange.length === 0 ||
+      !lowRange  || lowRange.length  === 0) {
+    console.writeln("  [" + filter + "] AUTOSIGMA: plages vides — sigma fixe utilisé");
+    return { sigmaLow: CONFIG.sigmaLow, sigmaHigh: CONFIG.sigmaHigh,
+             sweepHigh: [], sweepLow: [] };
+  }
+
+  var sigmaLow_init = lowRange[Math.floor(lowRange.length / 2)];
+  var totalProbes   = highRange.length + lowRange.length;
+
+  console.writeln("  [" + filter + "] AUTOSIGMA Phase A — balayage sigmaHigh " +
+    "[" + highRange.join(", ") + "] (sigmaLow fixe=" + sigmaLow_init + ")");
+
+  // ---- Phase A : balayage sigmaHigh ----
+  var sweepHigh    = [];
+  var bestHighMAD  = 999999;
+  var bestSigmaHigh = highRange[0];
+
+  for (var hi = 0; hi < highRange.length; hi++) {
+    var sigH = highRange[hi];
+    writeStatus("AUTOSIGMA_" + filter, "SWEEP_HIGH_" + sigH,
+      { probe: hi + 1, total: totalProbes });
+
+    var r = probeIntegration(images, sigmaLow_init, sigH);
+
+    sweepHigh.push({
+      sigmaHigh:   sigH,
+      sigmaLow:    sigmaLow_init,
+      mad:         r.mad,
+      rejRateHigh: r.rejRateHigh,
+      rejRateLow:  r.rejRateLow
+    });
+
+    console.writeln("    sigmaHigh=" + sigH.toFixed(1) +
+      "  MAD=" + r.mad.toFixed(7) +
+      "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
+      "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
+
+    if (r.mad < bestHighMAD) {
+      bestHighMAD   = r.mad;
+      bestSigmaHigh = sigH;
+    }
+  }
+
+  console.writeln("  [" + filter + "] Phase A terminée — bestSigmaHigh=" +
+    bestSigmaHigh + " (MAD=" + bestHighMAD.toFixed(7) + ")");
+
+  // ---- Phase B : balayage sigmaLow (sigmaHigh fixé) ----
+  console.writeln("  [" + filter + "] AUTOSIGMA Phase B — balayage sigmaLow " +
+    "[" + lowRange.join(", ") + "] (sigmaHigh fixe=" + bestSigmaHigh + ")");
+
+  var sweepLow    = [];
+  var bestLowMAD  = 999999;
+  var bestSigmaLow = lowRange[0];
+
+  for (var li = 0; li < lowRange.length; li++) {
+    var sigL = lowRange[li];
+    writeStatus("AUTOSIGMA_" + filter, "SWEEP_LOW_" + sigL,
+      { probe: highRange.length + li + 1, total: totalProbes });
+
+    var r = probeIntegration(images, sigL, bestSigmaHigh);
+
+    sweepLow.push({
+      sigmaHigh:   bestSigmaHigh,
+      sigmaLow:    sigL,
+      mad:         r.mad,
+      rejRateHigh: r.rejRateHigh,
+      rejRateLow:  r.rejRateLow
+    });
+
+    console.writeln("    sigmaLow=" + sigL.toFixed(1) +
+      "  MAD=" + r.mad.toFixed(7) +
+      "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
+      "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
+
+    if (r.mad < bestLowMAD) {
+      bestLowMAD   = r.mad;
+      bestSigmaLow = sigL;
+    }
+  }
+
+  console.writeln("  [" + filter + "] Phase B terminée — bestSigmaLow=" +
+    bestSigmaLow + " (MAD=" + bestLowMAD.toFixed(7) + ")");
+
+  // ---- Tableau récapitulatif console ----
+  console.writeln("  [" + filter + "] ── RÉSULTAT AUTOSIGMA ──────────────────");
+  console.writeln("  [" + filter + "]   sigmaLow=" + bestSigmaLow +
+    "  sigmaHigh=" + bestSigmaHigh);
+  console.writeln("  [" + filter + "]   Sweep High (" + sweepHigh.length + " probes) :");
+  for (var s = 0; s < sweepHigh.length; s++) {
+    var sw = sweepHigh[s];
+    var marker = (sw.sigmaHigh === bestSigmaHigh) ? "  ← BEST" : "";
+    console.writeln("  [" + filter + "]     sigmaHigh=" + sw.sigmaHigh.toFixed(1) +
+      "  MAD=" + sw.mad.toFixed(7) + marker);
+  }
+  console.writeln("  [" + filter + "]   Sweep Low (" + sweepLow.length + " probes) :");
+  for (var s = 0; s < sweepLow.length; s++) {
+    var sw = sweepLow[s];
+    var marker = (sw.sigmaLow === bestSigmaLow) ? "  ← BEST" : "";
+    console.writeln("  [" + filter + "]     sigmaLow=" + sw.sigmaLow.toFixed(1) +
+      "  MAD=" + sw.mad.toFixed(7) + marker);
+  }
+  console.writeln("  [" + filter + "] ────────────────────────────────────────");
+
+  // ---- Export JSON ----
+  var searchData = {
+    filter:        filter,
+    ts:            (new Date()).toISOString(),
+    algorithm:     "coordinate-descent-MAD v1.4.0",
+    nImages:       images.length,
+    sigmaLow_init: sigmaLow_init,
+    bestSigmaHigh: bestSigmaHigh,
+    bestSigmaLow:  bestSigmaLow,
+    bestMAD_High:  bestHighMAD,
+    bestMAD_Low:   bestLowMAD,
+    sweepHigh:     sweepHigh,
+    sweepLow:      sweepLow
+  };
+  writeJSON(CONFIG.resultDir + "/" + filter + "_sigma_search.json", searchData);
+  console.writeln("  [" + filter + "] Sigma search JSON: " +
+    CONFIG.resultDir + "/" + filter + "_sigma_search.json");
+
+  return {
+    sigmaLow:  bestSigmaLow,
+    sigmaHigh: bestSigmaHigh,
+    sweepHigh: sweepHigh,
+    sweepLow:  sweepLow
+  };
+}
+
+// ============================================================
 // PHASE 6 : ImageIntegration
 // ============================================================
 
 function runIntegration(filter) {
-  var calDir = CONFIG.rootDir + "/" + filter + "/calibrated";
+  var calDir  = CONFIG.rootDir + "/" + filter + "/calibrated";
   var outPath = CONFIG.resultDir + "/" + filter + "_integration.xisf";
 
   if (fileExists(outPath)) {
@@ -934,41 +1159,77 @@ function runIntegration(filter) {
     return;
   }
 
+  // Tableau 4 colonnes partagé probes + intégration finale
   var images = [];
   for (var i = 0; i < alignedFiles.length; i++) {
     var xdrzPath = alignedFiles[i].replace(".xisf", ".xdrz");
     images.push([true, alignedFiles[i], xdrzPath, ""]);
   }
 
+  // ---- Sélection sigma ----
+  var useSigmaLow, useSigmaHigh;
+
+  if (CONFIG.autoSigma) {
+    writeStatus("AUTOSIGMA_" + filter, "STARTED", { nImages: alignedFiles.length });
+    var sigmaResult = findOptimalSigma(filter, images);
+    useSigmaLow  = sigmaResult.sigmaLow;
+    useSigmaHigh = sigmaResult.sigmaHigh;
+    console.writeln("  [" + filter + "] Sigma optimal : low=" +
+      useSigmaLow + "  high=" + useSigmaHigh);
+    writeStatus("AUTOSIGMA_" + filter, "DONE",
+      { sigmaLow: useSigmaLow, sigmaHigh: useSigmaHigh });
+  } else {
+    useSigmaLow  = CONFIG.sigmaLow;
+    useSigmaHigh = CONFIG.sigmaHigh;
+    console.writeln("  [" + filter + "] Sigma fixe : low=" +
+      useSigmaLow + "  high=" + useSigmaHigh);
+  }
+
+  // ---- Intégration finale (drizzle ON + rejection maps ON pour contrôle) ----
   var ii = new ImageIntegration();
-  ii.images               = images;
-  ii.combination          = ImageIntegration.prototype.Average;
-  ii.weightMode           = ImageIntegration.prototype.KeywordWeight;
-  ii.weightKeyword        = "SSWEIGHT";
-  ii.weightScale          = ImageIntegration.prototype.WeightScale_BWMV;
-  ii.minWeight            = 0.005;
-  ii.normalization        = ImageIntegration.prototype.AdditiveWithScaling;
-  ii.rejection            = ImageIntegration.prototype.SigmaClip;
+  ii.images                 = images;
+  ii.combination            = ImageIntegration.prototype.Average;
+  ii.weightMode             = ImageIntegration.prototype.KeywordWeight;
+  ii.weightKeyword          = "SSWEIGHT";
+  ii.weightScale            = ImageIntegration.prototype.WeightScale_BWMV;
+  ii.minWeight              = 0.005;
+  ii.normalization          = ImageIntegration.prototype.AdditiveWithScaling;
+  ii.rejection              = ImageIntegration.prototype.SigmaClip;
   ii.rejectionNormalization = ImageIntegration.prototype.Scale;
-  ii.sigmaLow             = CONFIG.sigmaLow;
-  ii.sigmaHigh            = CONFIG.sigmaHigh;
-  ii.clipLow              = true;
-  ii.clipHigh             = true;
-  ii.generateDrizzleData  = true;
+  ii.sigmaLow               = useSigmaLow;
+  ii.sigmaHigh              = useSigmaHigh;
+  ii.clipLow                = true;
+  ii.clipHigh               = true;
+  ii.generateDrizzleData    = true;
   ii.generateIntegratedImage = true;
+  ii.generateRejectionMaps  = true;  // rejection maps sauvegardées pour contrôle visuel
 
   ii.executeGlobal();
 
+  // ---- Sauvegarde stack + rejection maps ----
+  // Ordre impératif : rejected_* AVANT integration
   var wins = ImageWindow.windows;
+  var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
+  var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
+
   for (var w = 0; w < wins.length; w++) {
-    if (wins[w].mainView.id.toLowerCase().indexOf("integration") >= 0) {
-      wins[w].saveAs(outPath, false, false, false, false);
+    var vid = wins[w].mainView.id.toLowerCase();
+    if (vid.indexOf("rejected_high") >= 0) {
+      wins[w].saveAs(pathHigh, false, false, false, false);
       wins[w].forceClose();
-      break;
+    } else if (vid.indexOf("rejected_low") >= 0) {
+      wins[w].saveAs(pathLow,  false, false, false, false);
+      wins[w].forceClose();
+    } else if (vid.indexOf("integration") >= 0) {
+      wins[w].saveAs(outPath,  false, false, false, false);
+      wins[w].forceClose();
     }
   }
   closeAllWindows();
-  console.writeln("  [" + filter + "] Integration saved: " + outPath);
+
+  console.writeln("  [" + filter + "] Integration saved    : " + outPath);
+  console.writeln("  [" + filter + "] Rejection high saved : " + pathHigh);
+  console.writeln("  [" + filter + "] Rejection low  saved : " + pathLow);
 }
 
 // ============================================================
@@ -1029,7 +1290,7 @@ function runDrizzle(filter) {
 
 function main() {
   ensureDir(CONFIG.resultDir);
-  writeStatus("INIT", "STARTED", { version: "1.3.0", config: CONFIG });
+  writeStatus("INIT", "STARTED", { version: "1.4.0", config: CONFIG });
 
   // ---- Détection des filtres ----
   var filters = CONFIG.filters || detectFilters();
@@ -1135,7 +1396,7 @@ function main() {
 
   // ---- Rapport final ----
   var report = {
-    version:   "1.3.0",
+    version:   "1.4.0",
     completed: (new Date()).toISOString(),
     rootDir:   CONFIG.rootDir,
     filters:   filters,
@@ -1147,9 +1408,21 @@ function main() {
 
   for (var f = 0; f < filters.length; f++) {
     report.results[filters[f]] = {
-      integration: CONFIG.resultDir + "/" + filters[f] + "_integration.xisf",
-      drizzle:     CONFIG.resultDir + "/" + filters[f] + "_drizzle_2x.xisf"
+      integration:    CONFIG.resultDir + "/" + filters[f] + "_integration.xisf",
+      drizzle:        CONFIG.resultDir + "/" + filters[f] + "_drizzle_2x.xisf",
+      rejectionHigh:  CONFIG.resultDir + "/" + filters[f] + "_rejection_high.xisf",
+      rejectionLow:   CONFIG.resultDir + "/" + filters[f] + "_rejection_low.xisf"
     };
+    // Ajouter les sigma optimaux s'ils ont été calculés
+    var sigmaSearch = readJSON(CONFIG.resultDir + "/" + filters[f] + "_sigma_search.json");
+    if (sigmaSearch) {
+      report.results[filters[f]].sigmaOptimization = {
+        sigmaLow:  sigmaSearch.bestSigmaLow,
+        sigmaHigh: sigmaSearch.bestSigmaHigh,
+        nProbes:   sigmaSearch.sweepHigh.length + sigmaSearch.sweepLow.length,
+        bestMAD:   sigmaSearch.bestMAD_Low
+      };
+    }
     if (bestFiles[filters[f]]) {
       report.bestImages[filters[f]] = {
         file: bestFiles[filters[f]].path ? File.extractName(bestFiles[filters[f]].path) : "N/A",
