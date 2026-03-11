@@ -45,38 +45,38 @@ astro-pipeline  ← THIS REPO
 
 ```
 astro-pipeline/
-├── pipeline.js          # Stable preprocessing pipeline (v1.2.1)
-├── pipeline_v130.js     # Development version (v1.3.0 — Noise + inter-night)
-├── run_LDN1320.js       # Example launcher — LDN 1320 BVR session
-└── README.md
+├── pipeline_v130.js     # Active pipeline (v1.5.0)
+├── run_session.js       # Generic launcher — edit ROOTDIR only
+├── README.md
+├── check_cal.ps1        # PowerShell: check calibrated file count
+├── check_new.ps1        # PowerShell: detect new output files
+├── check_progress.ps1   # PowerShell: read pipeline_status.json
+├── list_results.ps1     # PowerShell: list result files with sizes
+├── monitor.ps1          # PowerShell: single progress snapshot
+├── monitor_loop.ps1     # PowerShell: live progress loop
+├── read_log.ps1         # PowerShell: tail pipeline console log
+├── scan_dof.ps1         # PowerShell: scan DOF master files
+├── scan_rosette.ps1     # PowerShell: scan raw frames
+└── write_log.ps1        # PowerShell: write to pipeline log
 ```
 
 ### Launcher pattern
 
-Each session gets its own `run_XXX.js` file that overrides CONFIG and loads the pipeline:
+Edit `run_session.js` — change only `ROOTDIR`, everything else is auto:
 
 ```javascript
-// run_MyObject.js
-var CONFIG = {
-  rootDir:            "C:/MyObject",
-  dofDir:             "D:/ARO/PIX",
-  resultDir:          "C:/MyObject/result",
-  filters:            null,          // auto-detect: B, G, R, L, H, S, O, V
-  preferredRefFilter: "R",
-  subframeScale:      2.26,          // arcsec/pixel for your camera
-};
-eval(File.readTextFile("C:/astro-pipeline/pipeline.js"));
+// run_session.js — only line to change:
+var ROOTDIR = "C:/MyObject";
 ```
 
 **Launch from PixInsight console:**
 ```javascript
-eval(File.readTextFile("C:/astro-pipeline/run_MyObject.js"))
+eval(File.readTextFile("C:/astro-pipeline/run_session.js"))
 ```
 
 **Launch via Claude Code (MCP):**
 ```javascript
-// Claude uses the run_script MCP tool:
-eval(File.readTextFile("C:/astro-pipeline/run_MyObject.js"))
+eval(File.readTextFile("C:/astro-pipeline/run_session.js"))
 ```
 
 > ⚠️ Never paste pipeline code inline into the PixInsight console — silent transcription errors will occur. Always use `eval(File.readTextFile(...))`.
@@ -115,11 +115,13 @@ Filter aliases: `V → G`, `C → L` (configurable in `findDOFMasters()`).
 
 ## Configuration Reference
 
+All parameters with their defaults (from `run_session.js`):
+
 ```javascript
 var CONFIG = {
   // Paths
-  rootDir:            "C:/MyObject",   // folder with filter subfolders
-  dofDir:             "D:/ARO/PIX",    // DOF masters root
+  rootDir:            "C:/MyObject",          // folder with filter subfolders
+  dofDir:             "D:/ARO/PIX",           // DOF masters root
   resultDir:          "C:/MyObject/result",
 
   // Filters (null = auto-detect from subfolders B/G/R/L/H/S/O/V)
@@ -134,8 +136,13 @@ var CONFIG = {
   doDrizzle:          true,
 
   // ImageIntegration sigma clipping
-  sigmaLow:           4.0,
+  sigmaLow:           4.0,    // used only if autoSigma = false
   sigmaHigh:          3.0,
+
+  // AutoSigma — coordinate descent to find optimal sigma pair
+  autoSigma:          true,
+  autoSigmaHighRange: [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+  autoSigmaLowRange:  [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5],
 
   // Drizzle
   drizzleScale:       2.0,
@@ -145,21 +152,8 @@ var CONFIG = {
   wSNR:               1.0,   // SNR weight
   wFWHM:              1.2,   // FWHM weight (resolution impact — highest)
   wStars:             1.0,   // star count weight
+  wNoise:             0.8,   // sky background proxy (0 = disabled)
   iqrMult:            1.5,   // rejection threshold: Q3 + iqrMult * IQR
-
-  // Camera/optics
-  subframeScale:      2.26,  // arcsec/pixel
-
-  // StarAlignment reference filter
-  preferredRefFilter: "R",
-};
-```
-
-### v1.3.0 additional CONFIG options (pipeline_v130.js)
-
-```javascript
-  // Noise criterion (sky background proxy via residual noise post-ABE)
-  wNoise:             0.8,   // 0 = disabled
   noiseColIdx:        10,    // SubframeSelector column index for Noise
   debugColumns:       false, // set true once to confirm noiseColIdx
 
@@ -167,6 +161,13 @@ var CONFIG = {
   rejectBadNights:    true,  // reject entire degraded nights automatically
   nightIqrMult:       1.5,
   minNightSize:       3,     // min images per night to be analyzed
+
+  // Camera/optics
+  subframeScale:      1.84,  // arcsec/pixel (ARO default)
+
+  // StarAlignment reference filter (H > R > first detected)
+  preferredRefFilter: "H",
+};
 ```
 
 ## Image Selection Algorithm (MAD+IQR)
@@ -240,6 +241,7 @@ Issues encountered and documented during development:
 | `for...in` on StarAlignment | PixInsight access violation crash | Use `toSource()` only |
 | `ImageCalibration.inputFiles` | Does nothing | Use `ic.targetFrames = [[true, path], ...]` |
 | Inline code in console | Silent transcription errors | Always use `eval(File.readTextFile(...))` |
+| ABE background model windows | Extra windows accumulate in PixInsight | Capture window list before `executeOn()`, close all new windows after |
 
 ## License
 
