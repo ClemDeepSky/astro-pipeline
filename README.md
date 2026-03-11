@@ -229,15 +229,6 @@ result/
 └── *_c_abe_a_r.xdrz          ← Drizzle data
 ```
 
-## Processed Sessions
-
-| Object | Filters | Frames | Approved | Duration |
-|---|---|---|---|---|
-| Rosette Nebula | Ha | 112 | 75 (67%) | ~45 min |
-| M45 Pleiades | B/G/R | 180 | 165 (92%) | ~1h |
-| M45 Pleiades | L | 246 | 202 (82%) | ~1h20 |
-| LDN 1320 | B/R/V | 109 | 100 (92%) | ~45 min |
-
 ## Known PJSR Gotchas
 
 Issues encountered and documented during development:
