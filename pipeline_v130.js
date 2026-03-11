@@ -617,12 +617,14 @@ function runABE(filter) {
     abe.samplesPerRow = 20;
     abe.correctOnlyEnabled = true;
 
-    var winsBefore = ImageWindow.windows.map(function(w) { return w.uniqueId; });
+    var idsBefore = ImageWindow.windows.map(function(w) { return w.mainView.id; });
     abe.executeOn(win.mainView);
     // Fermer les fenêtres background créées par ABE (background model)
-    ImageWindow.windows.forEach(function(w) {
-      if (winsBefore.indexOf(w.uniqueId) < 0 && w !== win) w.forceClose();
-    });
+    var winsAfter = ImageWindow.windows;
+    for (var wi = winsAfter.length - 1; wi >= 0; wi--) {
+      var w = winsAfter[wi];
+      if (idsBefore.indexOf(w.mainView.id) < 0 && w !== win) w.forceClose();
+    }
 
     win.saveAs(outPath, false, false, false, false);
     win.forceClose();
