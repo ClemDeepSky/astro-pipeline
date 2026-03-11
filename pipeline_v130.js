@@ -25,9 +25,10 @@
 //
 // ============================================================
 // CONFIGURATION - À ADAPTER PAR SESSION
+// (si CONFIG est déjà défini par un launcher externe, ce bloc est ignoré)
 // ============================================================
 
-var CONFIG = {
+if (typeof CONFIG === 'undefined') var CONFIG = {
   rootDir:           "D:/Gost",
   dofDir:            "D:/Terrapixa Dropbox/clement ver eecke/ARO/PIX",
   resultDir:         "D:/Gost/result",
@@ -86,7 +87,7 @@ var CONFIG = {
 
   // Filtre préféré pour la référence StarAlignment
   preferredRefFilter: "R",
-};
+}; // fin CONFIG (guard: ignoré si CONFIG déjà défini)
 
 // ============================================================
 // UTILITAIRES
