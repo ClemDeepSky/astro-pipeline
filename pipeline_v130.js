@@ -446,8 +446,8 @@ function findDOFMasters(filter, temp, expTime) {
              : (darkFiles.length > 0 ? darkFiles[0] : null);
   }
 
-  // Flat avec alias filtre (V→G, C→L)
-  var flatAliases = { "V": "G", "C": "L" };
+  // Flat avec alias filtre (V→G, C→L, O→OIII)
+  var flatAliases = { "V": "G", "C": "L", "O": "OIII" };
   var flatFilter = filter;
   var flatByFilter = flatFiles.filter(function(f) {
     return f.indexOf("_" + flatFilter + "_") >= 0 || f.indexOf("_" + flatFilter + "-") >= 0;
