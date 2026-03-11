@@ -59,7 +59,7 @@ var CONFIG = {
   debugColumns:       false,
   noiseColIdx:        10,
 
-  subframeScale:      2.26,
+  subframeScale:      1.84,
 
   // Référence StarAlignment : H > R > premier filtre détecté
   // (le pipeline choisit automatiquement si le filtre préféré est absent)

@@ -616,7 +616,13 @@ function runABE(filter) {
     abe.useRoiOrPreview = false;
     abe.samplesPerRow = 20;
     abe.correctOnlyEnabled = true;
+
+    var winsBefore = ImageWindow.windows.map(function(w) { return w.uniqueId; });
     abe.executeOn(win.mainView);
+    // Fermer les fenêtres background créées par ABE (background model)
+    ImageWindow.windows.forEach(function(w) {
+      if (winsBefore.indexOf(w.uniqueId) < 0 && w !== win) w.forceClose();
+    });
 
     win.saveAs(outPath, false, false, false, false);
     win.forceClose();
