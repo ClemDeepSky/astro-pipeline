@@ -1,10 +1,14 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.5.0
+// Version: 1.5.1
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.5.1 vs v1.5.0 :
+//   - BUG FIXÉ : rejection maps non sauvegardées (forceClose() dans boucle wins)
+//     Fix : capturer highWin/lowWin/intWin d'abord, sauvegarder ensuite
 //
 // Nouveautés v1.5.0 vs v1.4.0 :
 //   - log() : toutes les Console.writeln() dupliquées dans pipeline_console.log
@@ -1232,29 +1236,36 @@ function runIntegration(filter) {
   ii.executeGlobal();
 
   // ---- Sauvegarde stack + rejection maps ----
-  // Ordre impératif : rejected_* AVANT integration
-  var wins = ImageWindow.windows;
+  // IMPORTANT : capturer les références AVANT de fermer quoi que ce soit.
+  // forceClose() dans une boucle sur ImageWindow.windows réorganise le tableau
+  // et saute des fenêtres → les rejection maps étaient perdues (bug v1.4.0).
   var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
   var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
 
+  var intWin  = null, highWin = null, lowWin = null;
+  var wins = ImageWindow.windows;
   for (var w = 0; w < wins.length; w++) {
     var vid = wins[w].mainView.id.toLowerCase();
-    if (vid.indexOf("rejected_high") >= 0) {
-      wins[w].saveAs(pathHigh, false, false, false, false);
-      wins[w].forceClose();
-    } else if (vid.indexOf("rejected_low") >= 0) {
-      wins[w].saveAs(pathLow,  false, false, false, false);
-      wins[w].forceClose();
-    } else if (vid.indexOf("integration") >= 0) {
-      wins[w].saveAs(outPath,  false, false, false, false);
-      wins[w].forceClose();
-    }
+    if      (vid.indexOf("rejected_high") >= 0) { highWin = wins[w]; }
+    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = wins[w]; }
+    else if (vid.indexOf("integration")   >= 0) { intWin  = wins[w]; }
   }
+
+  // Sauvegarder puis fermer — dans l'ordre, sans toucher au tableau
+  if (highWin) { highWin.saveAs(pathHigh, false, false, false, false); highWin.forceClose(); }
+  else { log("  [" + filter + "] WARNING: rejection_high introuvable"); }
+
+  if (lowWin)  { lowWin.saveAs(pathLow,   false, false, false, false); lowWin.forceClose();  }
+  else { log("  [" + filter + "] WARNING: rejection_low introuvable"); }
+
+  if (intWin)  { intWin.saveAs(outPath,   false, false, false, false); intWin.forceClose();  }
+  else { log("  [" + filter + "] WARNING: integration introuvable"); }
+
   closeAllWindows();
 
-  log("  [" + filter + "] Integration saved    : " + outPath);
-  log("  [" + filter + "] Rejection high saved : " + pathHigh);
-  log("  [" + filter + "] Rejection low  saved : " + pathLow);
+  if (intWin)  { log("  [" + filter + "] Integration saved    : " + outPath); }
+  if (highWin) { log("  [" + filter + "] Rejection high saved : " + pathHigh); }
+  if (lowWin)  { log("  [" + filter + "] Rejection low  saved : " + pathLow); }
 }
 
 // ============================================================
