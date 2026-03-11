@@ -1,10 +1,13 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.4.0
+// Version: 1.5.0
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.5.0 vs v1.4.0 :
+//   - log() : toutes les Console.writeln() dupliquées dans pipeline_console.log
 //
 // Nouveautés v1.4.0 vs v1.3.0 :
 //   - Auto-optimisation sigma (coordinate descent + minimisation MAD)
@@ -90,6 +93,27 @@ if (typeof CONFIG === 'undefined') var CONFIG = {
 }; // fin CONFIG (guard: ignoré si CONFIG déjà défini)
 
 // ============================================================
+// LOGGER — console + fichier disque
+// ============================================================
+var _logFile = null;
+function log(msg) {
+    Console.writeln(msg);
+    try {
+        if (_logFile === null && typeof CONFIG !== 'undefined' && CONFIG.resultDir) {
+            if (!File.directoryExists(CONFIG.resultDir)) {
+                File.createDirectory(CONFIG.resultDir, true);
+            }
+            _logFile = CONFIG.resultDir + "/pipeline_console.log";
+            // Write header on first call
+            File.appendToTextFile(_logFile, "\n==== SESSION " + (new Date().toISOString()) + " ====\n");
+        }
+        if (_logFile !== null) {
+            File.appendToTextFile(_logFile, msg + "\n");
+        }
+    } catch(e) { /* never break pipeline for logging */ }
+}
+
+// ============================================================
 // UTILITAIRES
 // ============================================================
 
@@ -102,7 +126,7 @@ function writeStatus(phase, msg, extra) {
   f.create(CONFIG.resultDir + "/pipeline_status.json");
   f.outTextLn(JSON.stringify(obj));
   f.close();
-  console.writeln("[" + phase + "] " + msg);
+  log("[" + phase + "] " + msg);
 }
 
 function ensureDir(path) {
@@ -248,7 +272,7 @@ function rejectBadNightsFilter(data, filter) {
   for (var n in nights) nightKeys.push(n);
 
   if (nightKeys.length <= 1) {
-    console.writeln("  [" + filter + "] NIGHTS: session mono-nuit → analyse inter-nuits ignorée");
+    log("  [" + filter + "] NIGHTS: session mono-nuit → analyse inter-nuits ignorée");
     return data;
   }
 
@@ -259,7 +283,7 @@ function rejectBadNightsFilter(data, filter) {
     var imgs  = nights[nKey];
 
     if (imgs.length < CONFIG.minNightSize) {
-      console.writeln("  [" + filter + "] NIGHTS: nuit " + nKey +
+      log("  [" + filter + "] NIGHTS: nuit " + nKey +
         " (" + imgs.length + " images < minNightSize=" + CONFIG.minNightSize +
         ") → exclue de l'analyse inter-nuits");
       nightStats.push({ night: nKey, count: imgs.length, skip: true, images: imgs });
@@ -287,7 +311,7 @@ function rejectBadNightsFilter(data, filter) {
   var analyzable = nightStats.filter(function(ns) { return !ns.skip; });
 
   if (analyzable.length <= 1) {
-    console.writeln("  [" + filter + "] NIGHTS: pas assez de nuits analysables → analyse ignorée");
+    log("  [" + filter + "] NIGHTS: pas assez de nuits analysables → analyse ignorée");
     return data;
   }
 
@@ -328,7 +352,7 @@ function rejectBadNightsFilter(data, filter) {
   var IQRn = Q3n - Q1n;
   var nightThreshold = Q3n + CONFIG.nightIqrMult * IQRn;
 
-  console.writeln("  [" + filter + "] NIGHTS: " + analyzable.length + " nuits analysées" +
+  log("  [" + filter + "] NIGHTS: " + analyzable.length + " nuits analysées" +
     " | seuil score=" + nightThreshold.toFixed(3));
 
   var rejectedPaths = {};
@@ -339,7 +363,7 @@ function rejectBadNightsFilter(data, filter) {
     var bad = (ns.nightScore > nightThreshold);
     var status = bad ? "REJETÉE" : "OK";
 
-    console.writeln("  [" + filter + "] NIGHTS:   " + ns.night +
+    log("  [" + filter + "] NIGHTS:   " + ns.night +
       " (" + ns.count + " img)" +
       " FWHM=" + ns.medFWHM.toFixed(2)  + "\"" +
       " SNR="  + ns.medSNR.toFixed(3)   +
@@ -360,10 +384,10 @@ function rejectBadNightsFilter(data, filter) {
   var nRej = data.length - filtered.length;
 
   if (nRej > 0) {
-    console.writeln("  [" + filter + "] NIGHTS: " + nRej +
+    log("  [" + filter + "] NIGHTS: " + nRej +
       " images rejetées (nuits dégradées)");
   } else {
-    console.writeln("  [" + filter + "] NIGHTS: toutes les nuits acceptées");
+    log("  [" + filter + "] NIGHTS: toutes les nuits acceptées");
   }
 
   return filtered;
@@ -459,7 +483,7 @@ function findDOFMasters(filter, temp, expTime) {
       return f.indexOf("_" + flatFilter + "_") >= 0 || f.indexOf("_" + flatFilter + "-") >= 0;
     });
     if (flatByFilter.length > 0) {
-      console.writeln("  DOF flat: alias " + filter + "→" + flatFilter);
+      log("  DOF flat: alias " + filter + "→" + flatFilter);
     }
   }
   if (flatByFilter.length > 0) {
@@ -470,7 +494,7 @@ function findDOFMasters(filter, temp, expTime) {
     dof.flat = (flatByFilterTemp.length > 0) ? flatByFilterTemp[0] : flatByFilter[0];
   }
 
-  console.writeln("  DOF " + filter + " (T=" + tempRounded + "°C Exp=" + expInt + "s):" +
+  log("  DOF " + filter + " (T=" + tempRounded + "°C Exp=" + expInt + "s):" +
     " bias=" + (dof.bias ? File.extractName(dof.bias) : "NONE") +
     " | dark=" + (dof.dark ? File.extractName(dof.dark) : "NONE") +
     " | flat=" + (dof.flat ? File.extractName(dof.flat) : "NONE"));
@@ -503,13 +527,13 @@ function runCalibration(filter) {
   rawFiles.sort();
 
   if (rawFiles.length === 0) {
-    console.writeln("  [" + filter + "] No raw files - skipping calibration");
+    log("  [" + filter + "] No raw files - skipping calibration");
     return 0;
   }
 
   var existing = findFiles(calDir, "*_c.xisf");
   if (existing.length >= rawFiles.length * 0.9) {
-    console.writeln("  [" + filter + "] Calibration already done (" + existing.length + " files)");
+    log("  [" + filter + "] Calibration already done (" + existing.length + " files)");
     return existing.length;
   }
 
@@ -537,7 +561,7 @@ function runCalibration(filter) {
   ic.executeGlobal();
 
   var count = findFiles(calDir, "*_c.xisf").length;
-  console.writeln("  [" + filter + "] Calibrated: " + count + "/" + rawFiles.length);
+  log("  [" + filter + "] Calibrated: " + count + "/" + rawFiles.length);
   return count;
 }
 
@@ -555,13 +579,13 @@ function runABE(filter) {
   calFiles.sort();
 
   if (calFiles.length === 0) {
-    console.writeln("  [" + filter + "] No calibrated files for ABE");
+    log("  [" + filter + "] No calibrated files for ABE");
     return 0;
   }
 
   var existing = findFiles(calDir, "*_c_abe.xisf");
   if (existing.length >= calFiles.length * 0.9) {
-    console.writeln("  [" + filter + "] ABE already done (" + existing.length + " files)");
+    log("  [" + filter + "] ABE already done (" + existing.length + " files)");
     return existing.length;
   }
 
@@ -599,7 +623,7 @@ function runABE(filter) {
     }
   }
 
-  console.writeln("  [" + filter + "] ABE done: " + processed + "/" + calFiles.length);
+  log("  [" + filter + "] ABE done: " + processed + "/" + calFiles.length);
   return processed;
 }
 
@@ -612,14 +636,14 @@ function runSubframeAndSSWEIGHT(filter) {
   var abeFiles = findFiles(calDir, "*_c_abe.xisf");
 
   if (abeFiles.length === 0) {
-    console.writeln("  [" + filter + "] No ABE files for SubframeSelector");
+    log("  [" + filter + "] No ABE files for SubframeSelector");
     return [];
   }
 
   // Resume
   var existingA = findFiles(calDir, "*_c_abe_a.xisf");
   if (existingA.length >= abeFiles.length * 0.9) {
-    console.writeln("  [" + filter + "] SSWEIGHT already done (" + existingA.length + " files)");
+    log("  [" + filter + "] SSWEIGHT already done (" + existingA.length + " files)");
     return existingA;
   }
 
@@ -660,10 +684,10 @@ function runSubframeAndSSWEIGHT(filter) {
   // Diagnostic optionnel : log de tous les index de colonnes (première ligne)
   if (CONFIG.debugColumns && measurements.length > 0) {
     var row0 = measurements[0];
-    console.writeln("  [" + filter + "] DEBUG colonnes SubframeSelector (" +
+    log("  [" + filter + "] DEBUG colonnes SubframeSelector (" +
       row0.length + " colonnes) :");
     for (var ci = 0; ci < row0.length; ci++) {
-      console.writeln("    col[" + ci + "] = " + row0[ci]);
+      log("    col[" + ci + "] = " + row0[ci]);
     }
   }
 
@@ -692,7 +716,7 @@ function runSubframeAndSSWEIGHT(filter) {
   }
 
   if (data.length === 0) {
-    console.writeln("  [" + filter + "] WARNING: No measurements returned");
+    log("  [" + filter + "] WARNING: No measurements returned");
     return [];
   }
 
@@ -702,7 +726,7 @@ function runSubframeAndSSWEIGHT(filter) {
   data = rejectBadNightsFilter(data, filter);
 
   if (data.length === 0) {
-    console.writeln("  [" + filter + "] ERREUR: toutes les nuits rejetées — vérifier les données");
+    log("  [" + filter + "] ERREUR: toutes les nuits rejetées — vérifier les données");
     return [];
   }
 
@@ -728,10 +752,10 @@ function runSubframeAndSSWEIGHT(filter) {
   var dispStars = Math.max(madFn(starsArr, medStars),  1e-6);
   var dispNoise = Math.max(madFn(noiseArr, medNoise),  1e-6);
 
-  console.writeln("  [" + filter + "] Médiane: FWHM=" + medFWHM.toFixed(2) +
+  log("  [" + filter + "] Médiane: FWHM=" + medFWHM.toFixed(2) +
     "\" SNR=" + medSNR.toFixed(3) + " Stars=" + Math.round(medStars) +
     " Noise=" + medNoise.toFixed(5));
-  console.writeln("  [" + filter + "] MAD:     FWHM=" + dispFWHM.toFixed(2) +
+  log("  [" + filter + "] MAD:     FWHM=" + dispFWHM.toFixed(2) +
     "\" SNR=" + dispSNR.toFixed(3) + " Stars=" + Math.round(dispStars) +
     " Noise=" + dispNoise.toFixed(5));
 
@@ -765,7 +789,7 @@ function runSubframeAndSSWEIGHT(filter) {
   var IQR       = Q3 - Q1;
   var threshold = Q3 + CONFIG.iqrMult * IQR;
 
-  console.writeln("  [" + filter + "] Score IQR: Q1=" + Q1.toFixed(3) +
+  log("  [" + filter + "] Score IQR: Q1=" + Q1.toFixed(3) +
     " Q3=" + Q3.toFixed(3) + " IQR=" + IQR.toFixed(3) +
     " → seuil=" + threshold.toFixed(3));
 
@@ -787,19 +811,19 @@ function runSubframeAndSSWEIGHT(filter) {
   }
 
   var rejected = data.length - approved.length;
-  console.writeln("  [" + filter + "] Approuvés: " + approved.length + "/" + data.length +
+  log("  [" + filter + "] Approuvés: " + approved.length + "/" + data.length +
     " (rejetés: " + rejected + ", seuil score=" + threshold.toFixed(3) + ")");
 
   if (rejectionLog.length > 0) {
-    console.writeln("  [" + filter + "] Images rejetées :");
+    log("  [" + filter + "] Images rejetées :");
     for (var r = 0; r < rejectionLog.length; r++) {
       var rl = rejectionLog[r];
-      console.writeln("    score=" + rl.score + " " + rl.file + " | " + rl.reasons.join(", "));
+      log("    score=" + rl.score + " " + rl.file + " | " + rl.reasons.join(", "));
     }
   }
 
   if (approved.length === 0) {
-    console.writeln("  [" + filter + "] ERREUR: aucun fichier approuvé - vérifier les paramètres");
+    log("  [" + filter + "] ERREUR: aucun fichier approuvé - vérifier les paramètres");
     return [];
   }
 
@@ -877,7 +901,7 @@ function runSubframeAndSSWEIGHT(filter) {
   };
   writeJSON(CONFIG.resultDir + "/best_" + filter + ".json", bestInfo);
 
-  console.writeln("  [" + filter + "] Best: " + (bestPath ? File.extractName(bestPath) : "N/A") +
+  log("  [" + filter + "] Best: " + (bestPath ? File.extractName(bestPath) : "N/A") +
     " SSWEIGHT=" + bestSSW.toFixed(2));
   return outputFiles;
 }
@@ -894,7 +918,7 @@ function runStarAlignment(allApprovedFiles, referenceFile) {
     }
   }
   if (alreadyDone >= allApprovedFiles.length * 0.9) {
-    console.writeln("StarAlignment already done (" + alreadyDone + " files)");
+    log("StarAlignment already done (" + alreadyDone + " files)");
     return;
   }
 
@@ -927,7 +951,7 @@ function runStarAlignment(allApprovedFiles, referenceFile) {
   sa.targets          = targets;
 
   sa.executeGlobal();
-  console.writeln("StarAlignment complete");
+  log("StarAlignment complete");
 }
 
 // ============================================================
@@ -1013,7 +1037,7 @@ function findOptimalSigma(filter, images) {
   // Guard : plages vides → fallback sur valeurs fixes
   if (!highRange || highRange.length === 0 ||
       !lowRange  || lowRange.length  === 0) {
-    console.writeln("  [" + filter + "] AUTOSIGMA: plages vides — sigma fixe utilisé");
+    log("  [" + filter + "] AUTOSIGMA: plages vides — sigma fixe utilisé");
     return { sigmaLow: CONFIG.sigmaLow, sigmaHigh: CONFIG.sigmaHigh,
              sweepHigh: [], sweepLow: [] };
   }
@@ -1021,7 +1045,7 @@ function findOptimalSigma(filter, images) {
   var sigmaLow_init = lowRange[Math.floor(lowRange.length / 2)];
   var totalProbes   = highRange.length + lowRange.length;
 
-  console.writeln("  [" + filter + "] AUTOSIGMA Phase A — balayage sigmaHigh " +
+  log("  [" + filter + "] AUTOSIGMA Phase A — balayage sigmaHigh " +
     "[" + highRange.join(", ") + "] (sigmaLow fixe=" + sigmaLow_init + ")");
 
   // ---- Phase A : balayage sigmaHigh ----
@@ -1044,7 +1068,7 @@ function findOptimalSigma(filter, images) {
       rejRateLow:  r.rejRateLow
     });
 
-    console.writeln("    sigmaHigh=" + sigH.toFixed(1) +
+    log("    sigmaHigh=" + sigH.toFixed(1) +
       "  MAD=" + r.mad.toFixed(7) +
       "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
       "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
@@ -1055,11 +1079,11 @@ function findOptimalSigma(filter, images) {
     }
   }
 
-  console.writeln("  [" + filter + "] Phase A terminée — bestSigmaHigh=" +
+  log("  [" + filter + "] Phase A terminée — bestSigmaHigh=" +
     bestSigmaHigh + " (MAD=" + bestHighMAD.toFixed(7) + ")");
 
   // ---- Phase B : balayage sigmaLow (sigmaHigh fixé) ----
-  console.writeln("  [" + filter + "] AUTOSIGMA Phase B — balayage sigmaLow " +
+  log("  [" + filter + "] AUTOSIGMA Phase B — balayage sigmaLow " +
     "[" + lowRange.join(", ") + "] (sigmaHigh fixe=" + bestSigmaHigh + ")");
 
   var sweepLow    = [];
@@ -1081,7 +1105,7 @@ function findOptimalSigma(filter, images) {
       rejRateLow:  r.rejRateLow
     });
 
-    console.writeln("    sigmaLow=" + sigL.toFixed(1) +
+    log("    sigmaLow=" + sigL.toFixed(1) +
       "  MAD=" + r.mad.toFixed(7) +
       "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
       "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
@@ -1092,28 +1116,28 @@ function findOptimalSigma(filter, images) {
     }
   }
 
-  console.writeln("  [" + filter + "] Phase B terminée — bestSigmaLow=" +
+  log("  [" + filter + "] Phase B terminée — bestSigmaLow=" +
     bestSigmaLow + " (MAD=" + bestLowMAD.toFixed(7) + ")");
 
   // ---- Tableau récapitulatif console ----
-  console.writeln("  [" + filter + "] ── RÉSULTAT AUTOSIGMA ──────────────────");
-  console.writeln("  [" + filter + "]   sigmaLow=" + bestSigmaLow +
+  log("  [" + filter + "] ── RÉSULTAT AUTOSIGMA ──────────────────");
+  log("  [" + filter + "]   sigmaLow=" + bestSigmaLow +
     "  sigmaHigh=" + bestSigmaHigh);
-  console.writeln("  [" + filter + "]   Sweep High (" + sweepHigh.length + " probes) :");
+  log("  [" + filter + "]   Sweep High (" + sweepHigh.length + " probes) :");
   for (var s = 0; s < sweepHigh.length; s++) {
     var sw = sweepHigh[s];
     var marker = (sw.sigmaHigh === bestSigmaHigh) ? "  ← BEST" : "";
-    console.writeln("  [" + filter + "]     sigmaHigh=" + sw.sigmaHigh.toFixed(1) +
+    log("  [" + filter + "]     sigmaHigh=" + sw.sigmaHigh.toFixed(1) +
       "  MAD=" + sw.mad.toFixed(7) + marker);
   }
-  console.writeln("  [" + filter + "]   Sweep Low (" + sweepLow.length + " probes) :");
+  log("  [" + filter + "]   Sweep Low (" + sweepLow.length + " probes) :");
   for (var s = 0; s < sweepLow.length; s++) {
     var sw = sweepLow[s];
     var marker = (sw.sigmaLow === bestSigmaLow) ? "  ← BEST" : "";
-    console.writeln("  [" + filter + "]     sigmaLow=" + sw.sigmaLow.toFixed(1) +
+    log("  [" + filter + "]     sigmaLow=" + sw.sigmaLow.toFixed(1) +
       "  MAD=" + sw.mad.toFixed(7) + marker);
   }
-  console.writeln("  [" + filter + "] ────────────────────────────────────────");
+  log("  [" + filter + "] ────────────────────────────────────────");
 
   // ---- Export JSON ----
   var searchData = {
@@ -1130,7 +1154,7 @@ function findOptimalSigma(filter, images) {
     sweepLow:      sweepLow
   };
   writeJSON(CONFIG.resultDir + "/" + filter + "_sigma_search.json", searchData);
-  console.writeln("  [" + filter + "] Sigma search JSON: " +
+  log("  [" + filter + "] Sigma search JSON: " +
     CONFIG.resultDir + "/" + filter + "_sigma_search.json");
 
   return {
@@ -1150,13 +1174,13 @@ function runIntegration(filter) {
   var outPath = CONFIG.resultDir + "/" + filter + "_integration.xisf";
 
   if (fileExists(outPath)) {
-    console.writeln("  [" + filter + "] Integration already done");
+    log("  [" + filter + "] Integration already done");
     return;
   }
 
   var alignedFiles = findFiles(calDir, "*_c_abe_a_r.xisf");
   if (alignedFiles.length === 0) {
-    console.writeln("  [" + filter + "] No aligned files for integration");
+    log("  [" + filter + "] No aligned files for integration");
     return;
   }
 
@@ -1175,14 +1199,14 @@ function runIntegration(filter) {
     var sigmaResult = findOptimalSigma(filter, images);
     useSigmaLow  = sigmaResult.sigmaLow;
     useSigmaHigh = sigmaResult.sigmaHigh;
-    console.writeln("  [" + filter + "] Sigma optimal : low=" +
+    log("  [" + filter + "] Sigma optimal : low=" +
       useSigmaLow + "  high=" + useSigmaHigh);
     writeStatus("AUTOSIGMA_" + filter, "DONE",
       { sigmaLow: useSigmaLow, sigmaHigh: useSigmaHigh });
   } else {
     useSigmaLow  = CONFIG.sigmaLow;
     useSigmaHigh = CONFIG.sigmaHigh;
-    console.writeln("  [" + filter + "] Sigma fixe : low=" +
+    log("  [" + filter + "] Sigma fixe : low=" +
       useSigmaLow + "  high=" + useSigmaHigh);
   }
 
@@ -1228,9 +1252,9 @@ function runIntegration(filter) {
   }
   closeAllWindows();
 
-  console.writeln("  [" + filter + "] Integration saved    : " + outPath);
-  console.writeln("  [" + filter + "] Rejection high saved : " + pathHigh);
-  console.writeln("  [" + filter + "] Rejection low  saved : " + pathLow);
+  log("  [" + filter + "] Integration saved    : " + outPath);
+  log("  [" + filter + "] Rejection high saved : " + pathHigh);
+  log("  [" + filter + "] Rejection low  saved : " + pathLow);
 }
 
 // ============================================================
@@ -1242,13 +1266,13 @@ function runDrizzle(filter) {
   var outPath = CONFIG.resultDir + "/" + filter + "_drizzle_2x.xisf";
 
   if (fileExists(outPath)) {
-    console.writeln("  [" + filter + "] Drizzle already done");
+    log("  [" + filter + "] Drizzle already done");
     return;
   }
 
   var xdrzFiles = findFiles(calDir, "*_c_abe_a_r.xdrz");
   if (xdrzFiles.length === 0) {
-    console.writeln("  [" + filter + "] No .xdrz files for Drizzle");
+    log("  [" + filter + "] No .xdrz files for Drizzle");
     return;
   }
 
@@ -1282,7 +1306,7 @@ function runDrizzle(filter) {
     }
   }
   closeAllWindows();
-  console.writeln("  [" + filter + "] Drizzle saved: " + outPath);
+  log("  [" + filter + "] Drizzle saved: " + outPath);
 }
 
 // ============================================================
@@ -1297,10 +1321,10 @@ function main() {
   var filters = CONFIG.filters || detectFilters();
   if (filters.length === 0) {
     writeStatus("ERROR", "NO_FILTERS_DETECTED");
-    console.writeln("ERREUR: aucun sous-dossier de filtre trouvé dans " + CONFIG.rootDir);
+    log("ERREUR: aucun sous-dossier de filtre trouvé dans " + CONFIG.rootDir);
     return;
   }
-  console.writeln("Filtres: " + filters.join(", "));
+  log("Filtres: " + filters.join(", "));
 
   // ---- Phase 1: Calibration ----
   if (CONFIG.doCalibration) {
@@ -1349,7 +1373,7 @@ function main() {
 
   if (allApproved.length === 0) {
     writeStatus("ERROR", "NO_APPROVED_FILES");
-    console.writeln("ERREUR: Aucun fichier approuvé. Vérifier les données source.");
+    log("ERREUR: Aucun fichier approuvé. Vérifier les données source.");
     return;
   }
 
@@ -1366,7 +1390,7 @@ function main() {
     }
   }
   if (!refFile && allApproved.length > 0) refFile = allApproved[0];
-  console.writeln("Référence StarAlignment: " + (refFile ? File.extractName(refFile) : "N/A"));
+  log("Référence StarAlignment: " + (refFile ? File.extractName(refFile) : "N/A"));
 
   // ---- Phase 4: StarAlignment ----
   if (CONFIG.doAlign && refFile) {
@@ -1437,11 +1461,11 @@ function main() {
   writeJSON(CONFIG.resultDir + "/pipeline_report.json", report);
   writeStatus("COMPLETE", "ALL_DONE", { report: CONFIG.resultDir + "/pipeline_report.json" });
 
-  console.writeln("");
-  console.writeln("╔══════════════════════════════════════╗");
-  console.writeln("║   PIPELINE COMPLETE - " + filters.join("+") + "        ║");
-  console.writeln("╚══════════════════════════════════════╝");
-  console.writeln("Rapport: " + CONFIG.resultDir + "/pipeline_report.json");
+  log("");
+  log("╔══════════════════════════════════════╗");
+  log("║   PIPELINE COMPLETE - " + filters.join("+") + "        ║");
+  log("╚══════════════════════════════════════╝");
+  log("Rapport: " + CONFIG.resultDir + "/pipeline_report.json");
 }
 
 // ---- Lancement ----
