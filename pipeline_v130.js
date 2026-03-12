@@ -628,6 +628,9 @@ function runABE(filter) {
     var idsBefore = {};
     ImageWindow.windows.forEach(function(w) { idsBefore[w.mainView.id] = true; });
     abe.executeOn(win.mainView);
+    // processEvents + gc : force PixInsight à finaliser la création des
+    // fenêtres background AVANT qu'on tente de les détecter (création asynchrone)
+    processEvents(); gc();
     // Fermer TOUTES les nouvelles fenêtres créées par ABE (background model)
     // win.mainView.id est dans idsBefore → il ne sera pas fermé
     var winsAfter = ImageWindow.windows;
@@ -1016,34 +1019,48 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
   ii.generateRejectionMaps  = true;
 
   ii.executeGlobal();
+  // Flush event queue : PixInsight finalise la création des fenêtres de manière
+  // asynchrone — sans processEvents() elles peuvent être absentes du snapshot
+  processEvents(); gc();
 
-  // Identifier UNIQUEMENT les nouvelles fenêtres créées par cette exécution
+  // Identifier UNIQUEMENT les nouvelles fenêtres créées par cette exécution.
+  // Stratégie : name-based EN PREMIER, puis fallback positionnel (ordre de création
+  // PixInsight : integration → rejected_high → rejected_low).
   var intWin  = null;
   var highWin = null;
   var lowWin  = null;
+  var probeNewWins = [];
   var winsAfterProbe = ImageWindow.windows;
   for (var w = 0; w < winsAfterProbe.length; w++) {
     var pw = winsAfterProbe[w];
     if (idsBeforeProbe[pw.mainView.id]) continue;  // fenêtre pré-existante
+    probeNewWins.push(pw);
     var vid = pw.mainView.id.toLowerCase();
-    if      (vid.indexOf("rejected_high") >= 0) { highWin = pw; }
-    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = pw; }
-    else                                         { intWin  = pw; }
+    // PixInsight peut nommer "rejected_high", "high", "rej_high"… → chercher "high"/"low"
+    if      (vid.indexOf("high") >= 0) { highWin = pw; }
+    else if (vid.indexOf("low")  >= 0) { lowWin  = pw; }
+    else                               { intWin  = pw; }
   }
+  // Fallback positionnel si name-based n'a rien trouvé
+  if (probeNewWins.length >= 1 && intWin  === null) intWin  = probeNewWins[0];
+  if (probeNewWins.length >= 2 && highWin === null) highWin = probeNewWins[1];
+  if (probeNewWins.length >= 3 && lowWin  === null) lowWin  = probeNewWins[2];
 
-  // MAD du stack (channel 0 — représentatif pour L et RGB)
+  // MAD du stack (channel 0)
   if (intWin !== null) {
     try { result.mad = intWin.mainView.image.MAD(0); }
     catch(e) { result.mad = 999999; }
   }
 
-  // Taux de rejet : mean d'une rejection map binaire (0=conservé, 1=rejeté)
+  // Taux de rejet : mean de la rejection map divisé par nImages
+  // (PixInsight stocke les comptes 0..N, pas des fractions)
+  var nImg = images.length || 1;
   if (highWin !== null) {
-    try { result.rejRateHigh = highWin.mainView.image.mean(0); }
+    try { result.rejRateHigh = highWin.mainView.image.mean(0) / nImg; }
     catch(e) { result.rejRateHigh = 0; }
   }
   if (lowWin !== null) {
-    try { result.rejRateLow = lowWin.mainView.image.mean(0); }
+    try { result.rejRateLow = lowWin.mainView.image.mean(0) / nImg; }
     catch(e) { result.rejRateLow = 0; }
   }
 
@@ -1057,12 +1074,15 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
               "_rH"       + rH + "pct" +
               "_rL"       + rL + "pct";
     ensureDir(saveInfo.dir);
-    if (intWin)  intWin.saveAs (saveInfo.dir + "/" + tag + "_stack.xisf",        false, false, false, false);
-    if (highWin) highWin.saveAs(saveInfo.dir + "/" + tag + "_rejmap_high.xisf",  false, false, false, false);
-    if (lowWin)  lowWin.saveAs (saveInfo.dir + "/" + tag + "_rejmap_low.xisf",   false, false, false, false);
+    if (intWin)  intWin.saveAs (saveInfo.dir + "/" + tag + "_stack.xisf",       false, false, false, false);
+    if (highWin) highWin.saveAs(saveInfo.dir + "/" + tag + "_rejmap_high.xisf", false, false, false, false);
+    if (lowWin)  lowWin.saveAs (saveInfo.dir + "/" + tag + "_rejmap_low.xisf",  false, false, false, false);
   }
 
-  closeAllWindows();
+  // Fermer UNIQUEMENT les fenêtres créées par ce probe (pas closeAllWindows)
+  for (var cw = probeNewWins.length - 1; cw >= 0; cw--) {
+    probeNewWins[cw].forceClose();
+  }
   return result;
 }
 
@@ -1279,27 +1299,35 @@ function runIntegration(filter) {
   ImageWindow.windows.forEach(function(w) { idsBeforeInt[w.mainView.id] = true; });
 
   ii.executeGlobal();
+  // Flush event queue : même raison que probeIntegration
+  processEvents(); gc();
 
   // ---- Sauvegarde stack + rejection maps ----
   var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
   var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
 
   // Identifier uniquement les nouvelles fenêtres créées par cette intégration
-  // (évite les faux positifs sur des fenêtres pré-existantes nommées "integration")
   var allWinsAfterInt = ImageWindow.windows;
+  var intNewWins = [];
   var allIds = [];
-  for (var wi = 0; wi < allWinsAfterInt.length; wi++) allIds.push(allWinsAfterInt[wi].mainView.id);
+  for (var wi = 0; wi < allWinsAfterInt.length; wi++) {
+    allIds.push(allWinsAfterInt[wi].mainView.id);
+    if (!idsBeforeInt[allWinsAfterInt[wi].mainView.id]) intNewWins.push(allWinsAfterInt[wi]);
+  }
   log("  [" + filter + "] Fenêtres ouvertes après Integration: [" + allIds.join(", ") + "]");
 
   var intWin  = null, highWin = null, lowWin = null;
-  for (var w = 0; w < allWinsAfterInt.length; w++) {
-    var fw = allWinsAfterInt[w];
-    if (idsBeforeInt[fw.mainView.id]) continue;  // fenêtre pré-existante
+  for (var w = 0; w < intNewWins.length; w++) {
+    var fw = intNewWins[w];
     var vid = fw.mainView.id.toLowerCase();
-    if      (vid.indexOf("rejected_high") >= 0) { highWin = fw; }
-    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = fw; }
-    else                                         { intWin  = fw; }
+    if      (vid.indexOf("high") >= 0) { highWin = fw; }
+    else if (vid.indexOf("low")  >= 0) { lowWin  = fw; }
+    else                               { intWin  = fw; }
   }
+  // Fallback positionnel
+  if (intNewWins.length >= 1 && intWin  === null) intWin  = intNewWins[0];
+  if (intNewWins.length >= 2 && highWin === null) highWin = intNewWins[1];
+  if (intNewWins.length >= 3 && lowWin  === null) lowWin  = intNewWins[2];
 
   // Sauvegarder puis fermer — allowOverwrite=true pour écrasement propre
   if (highWin) {
@@ -1323,7 +1351,11 @@ function runIntegration(filter) {
     else     log("  [" + filter + "] ERROR: saveAs integration a échoué (id=" + intWin.mainView.id + ")");
   } else { log("  [" + filter + "] WARNING: integration introuvable"); }
 
-  closeAllWindows();
+  // Fermer uniquement les fenêtres résiduelles de cette intégration (pas closeAllWindows)
+  var remaining = ImageWindow.windows;
+  for (var rw = remaining.length - 1; rw >= 0; rw--) {
+    if (!idsBeforeInt[remaining[rw].mainView.id]) remaining[rw].forceClose();
+  }
 }
 
 // ============================================================
