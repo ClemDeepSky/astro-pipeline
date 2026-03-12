@@ -1,10 +1,17 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.5.1
+// Version: 1.5.2
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.5.2 vs v1.5.1 :
+//   - BUG FIXÉ : rejection maps finale détectées par snapshot avant/après executeGlobal
+//     (l'ancienne détection par nom échouait si une fenêtre pré-existante contenait "integration")
+//   - BUG FIXÉ (probes) : même approche snapshot dans probeIntegration
+//   - FEATURE : CONFIG.saveProbes=true → sauvegarde chaque probe dans resultDir/probes/
+//     Nom de fichier : {filtre}_probe_sH{x}_sL{y}_rH{%}pct_rL{%}pct_{stack|rejmap_high|rejmap_low}.xisf
 //
 // Nouveautés v1.5.1 vs v1.5.0 :
 //   - BUG FIXÉ : rejection maps non sauvegardées (forceClose() dans boucle wins)
@@ -972,10 +979,11 @@ function runStarAlignment(allApprovedFiles, referenceFile) {
 // AUTO-SIGMA : probeIntegration + findOptimalSigma
 // ============================================================
 
-// Exécute une intégration légère sans écriture disque, sans drizzle.
+// Exécute une intégration probe (sans drizzle).
+// saveInfo (optionnel) : { dir, filter } → sauvegarde stack + rejection maps
+//   dans dir/ avec filename encodant les sigma et taux de rejet.
 // Retourne { mad, rejRateHigh, rejRateLow }.
-// Utilisé uniquement pour le balayage sigma — aucun fichier produit.
-function probeIntegration(images, sigmaLow, sigmaHigh) {
+function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
   var result = { mad: 999999, rejRateHigh: 0, rejRateLow: 0 };
   if (images.length === 0) return result;
 
@@ -984,6 +992,10 @@ function probeIntegration(images, sigmaLow, sigmaHigh) {
   for (var pi = 0; pi < images.length; pi++) {
     probeImages.push([images[pi][0], images[pi][1], "", ""]);
   }
+
+  // Snapshot des fenêtres ouvertes AVANT executeGlobal (détection robuste)
+  var idsBeforeProbe = {};
+  ImageWindow.windows.forEach(function(w) { idsBeforeProbe[w.mainView.id] = true; });
 
   var ii = new ImageIntegration();
   ii.images                 = probeImages;
@@ -999,24 +1011,24 @@ function probeIntegration(images, sigmaLow, sigmaHigh) {
   ii.sigmaHigh              = sigmaHigh;
   ii.clipLow                = true;
   ii.clipHigh               = true;
-  ii.generateDrizzleData    = false;  // pas de drizzle pour les probes
+  ii.generateDrizzleData    = false;
   ii.generateIntegratedImage = true;
-  ii.generateRejectionMaps  = true;   // pour lire les taux de rejet
+  ii.generateRejectionMaps  = true;
 
   ii.executeGlobal();
 
-  // Récolte des fenêtres — ordre impératif : rejected_* AVANT integration
-  // (car "integration_rejected_high" contient aussi "integration")
-  var wins = ImageWindow.windows;
+  // Identifier UNIQUEMENT les nouvelles fenêtres créées par cette exécution
   var intWin  = null;
   var highWin = null;
   var lowWin  = null;
-
-  for (var w = 0; w < wins.length; w++) {
-    var vid = wins[w].mainView.id.toLowerCase();
-    if (vid.indexOf("rejected_high") >= 0) { highWin = wins[w]; continue; }
-    if (vid.indexOf("rejected_low")  >= 0) { lowWin  = wins[w]; continue; }
-    if (vid.indexOf("integration")   >= 0) { intWin  = wins[w]; continue; }
+  var winsAfterProbe = ImageWindow.windows;
+  for (var w = 0; w < winsAfterProbe.length; w++) {
+    var pw = winsAfterProbe[w];
+    if (idsBeforeProbe[pw.mainView.id]) continue;  // fenêtre pré-existante
+    var vid = pw.mainView.id.toLowerCase();
+    if      (vid.indexOf("rejected_high") >= 0) { highWin = pw; }
+    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = pw; }
+    else                                         { intWin  = pw; }
   }
 
   // MAD du stack (channel 0 — représentatif pour L et RGB)
@@ -1026,7 +1038,6 @@ function probeIntegration(images, sigmaLow, sigmaHigh) {
   }
 
   // Taux de rejet : mean d'une rejection map binaire (0=conservé, 1=rejeté)
-  // mean(0) = fraction des pixels ayant subi au moins un rejet
   if (highWin !== null) {
     try { result.rejRateHigh = highWin.mainView.image.mean(0); }
     catch(e) { result.rejRateHigh = 0; }
@@ -1036,7 +1047,22 @@ function probeIntegration(images, sigmaLow, sigmaHigh) {
     catch(e) { result.rejRateLow = 0; }
   }
 
-  closeAllWindows();  // tout fermer, aucune sauvegarde
+  // Sauvegarde optionnelle : stack + rejection maps avec sigma+taux dans le nom
+  if (saveInfo && saveInfo.dir && saveInfo.filter) {
+    var rH  = (result.rejRateHigh * 100).toFixed(2);
+    var rL  = (result.rejRateLow  * 100).toFixed(2);
+    var tag = saveInfo.filter +
+              "_probe_sH" + sigmaHigh.toFixed(1) +
+              "_sL"       + sigmaLow.toFixed(1) +
+              "_rH"       + rH + "pct" +
+              "_rL"       + rL + "pct";
+    ensureDir(saveInfo.dir);
+    if (intWin)  intWin.saveAs (saveInfo.dir + "/" + tag + "_stack.xisf",        false, false, false, false);
+    if (highWin) highWin.saveAs(saveInfo.dir + "/" + tag + "_rejmap_high.xisf",  false, false, false, false);
+    if (lowWin)  lowWin.saveAs (saveInfo.dir + "/" + tag + "_rejmap_low.xisf",   false, false, false, false);
+  }
+
+  closeAllWindows();
   return result;
 }
 
@@ -1047,6 +1073,11 @@ function probeIntegration(images, sigmaLow, sigmaHigh) {
 function findOptimalSigma(filter, images) {
   var highRange = CONFIG.autoSigmaHighRange;
   var lowRange  = CONFIG.autoSigmaLowRange;
+
+  // saveInfo passé à probeIntegration si CONFIG.saveProbes est activé
+  var saveInfo = (CONFIG.saveProbes)
+    ? { dir: CONFIG.resultDir + "/probes", filter: filter }
+    : null;
 
   // Guard : plages vides → fallback sur valeurs fixes
   if (!highRange || highRange.length === 0 ||
@@ -1072,7 +1103,7 @@ function findOptimalSigma(filter, images) {
     writeStatus("AUTOSIGMA_" + filter, "SWEEP_HIGH_" + sigH,
       { probe: hi + 1, total: totalProbes });
 
-    var r = probeIntegration(images, sigmaLow_init, sigH);
+    var r = probeIntegration(images, sigmaLow_init, sigH, saveInfo);
 
     sweepHigh.push({
       sigmaHigh:   sigH,
@@ -1109,7 +1140,7 @@ function findOptimalSigma(filter, images) {
     writeStatus("AUTOSIGMA_" + filter, "SWEEP_LOW_" + sigL,
       { probe: highRange.length + li + 1, total: totalProbes });
 
-    var r = probeIntegration(images, sigL, bestSigmaHigh);
+    var r = probeIntegration(images, sigL, bestSigmaHigh, saveInfo);
 
     sweepLow.push({
       sigmaHigh:   bestSigmaHigh,
@@ -1243,27 +1274,31 @@ function runIntegration(filter) {
   ii.generateIntegratedImage = true;
   ii.generateRejectionMaps  = true;  // rejection maps sauvegardées pour contrôle visuel
 
+  // Snapshot des fenêtres ouvertes AVANT executeGlobal
+  var idsBeforeInt = {};
+  ImageWindow.windows.forEach(function(w) { idsBeforeInt[w.mainView.id] = true; });
+
   ii.executeGlobal();
 
   // ---- Sauvegarde stack + rejection maps ----
-  // IMPORTANT : capturer les références AVANT de fermer quoi que ce soit.
-  // forceClose() dans une boucle sur ImageWindow.windows réorganise le tableau
-  // et saute des fenêtres → les rejection maps étaient perdues (bug v1.4.0).
   var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
   var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
 
-  // Log diagnostic : tous les IDs ouverts après executeGlobal (aide au debug)
-  var allWins = ImageWindow.windows;
+  // Identifier uniquement les nouvelles fenêtres créées par cette intégration
+  // (évite les faux positifs sur des fenêtres pré-existantes nommées "integration")
+  var allWinsAfterInt = ImageWindow.windows;
   var allIds = [];
-  for (var wi = 0; wi < allWins.length; wi++) allIds.push(allWins[wi].mainView.id);
+  for (var wi = 0; wi < allWinsAfterInt.length; wi++) allIds.push(allWinsAfterInt[wi].mainView.id);
   log("  [" + filter + "] Fenêtres ouvertes après Integration: [" + allIds.join(", ") + "]");
 
   var intWin  = null, highWin = null, lowWin = null;
-  for (var w = 0; w < allWins.length; w++) {
-    var vid = allWins[w].mainView.id.toLowerCase();
-    if      (vid.indexOf("rejected_high") >= 0 || vid.indexOf("rejection_high") >= 0) { highWin = allWins[w]; }
-    else if (vid.indexOf("rejected_low")  >= 0 || vid.indexOf("rejection_low")  >= 0) { lowWin  = allWins[w]; }
-    else if (vid.indexOf("integration")   >= 0) { intWin  = allWins[w]; }
+  for (var w = 0; w < allWinsAfterInt.length; w++) {
+    var fw = allWinsAfterInt[w];
+    if (idsBeforeInt[fw.mainView.id]) continue;  // fenêtre pré-existante
+    var vid = fw.mainView.id.toLowerCase();
+    if      (vid.indexOf("rejected_high") >= 0) { highWin = fw; }
+    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = fw; }
+    else                                         { intWin  = fw; }
   }
 
   // Sauvegarder puis fermer — allowOverwrite=true pour écrasement propre
