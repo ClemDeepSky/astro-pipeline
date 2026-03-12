@@ -617,13 +617,15 @@ function runABE(filter) {
     abe.samplesPerRow = 20;
     abe.correctOnlyEnabled = true;
 
-    var idsBefore = ImageWindow.windows.map(function(w) { return w.mainView.id; });
+    // Hash map des IDs ouverts avant ABE (O(1) lookup)
+    var idsBefore = {};
+    ImageWindow.windows.forEach(function(w) { idsBefore[w.mainView.id] = true; });
     abe.executeOn(win.mainView);
-    // Fermer les fenêtres background créées par ABE (background model)
+    // Fermer TOUTES les nouvelles fenêtres créées par ABE (background model)
+    // win.mainView.id est dans idsBefore → il ne sera pas fermé
     var winsAfter = ImageWindow.windows;
     for (var wi = winsAfter.length - 1; wi >= 0; wi--) {
-      var w = winsAfter[wi];
-      if (idsBefore.indexOf(w.mainView.id) < 0 && w !== win) w.forceClose();
+      if (!idsBefore[winsAfter[wi].mainView.id]) winsAfter[wi].forceClose();
     }
 
     win.saveAs(outPath, false, false, false, false);
@@ -1250,30 +1252,43 @@ function runIntegration(filter) {
   var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
   var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
 
+  // Log diagnostic : tous les IDs ouverts après executeGlobal (aide au debug)
+  var allWins = ImageWindow.windows;
+  var allIds = [];
+  for (var wi = 0; wi < allWins.length; wi++) allIds.push(allWins[wi].mainView.id);
+  log("  [" + filter + "] Fenêtres ouvertes après Integration: [" + allIds.join(", ") + "]");
+
   var intWin  = null, highWin = null, lowWin = null;
-  var wins = ImageWindow.windows;
-  for (var w = 0; w < wins.length; w++) {
-    var vid = wins[w].mainView.id.toLowerCase();
-    if      (vid.indexOf("rejected_high") >= 0) { highWin = wins[w]; }
-    else if (vid.indexOf("rejected_low")  >= 0) { lowWin  = wins[w]; }
-    else if (vid.indexOf("integration")   >= 0) { intWin  = wins[w]; }
+  for (var w = 0; w < allWins.length; w++) {
+    var vid = allWins[w].mainView.id.toLowerCase();
+    if      (vid.indexOf("rejected_high") >= 0 || vid.indexOf("rejection_high") >= 0) { highWin = allWins[w]; }
+    else if (vid.indexOf("rejected_low")  >= 0 || vid.indexOf("rejection_low")  >= 0) { lowWin  = allWins[w]; }
+    else if (vid.indexOf("integration")   >= 0) { intWin  = allWins[w]; }
   }
 
-  // Sauvegarder puis fermer — dans l'ordre, sans toucher au tableau
-  if (highWin) { highWin.saveAs(pathHigh, false, false, false, false); highWin.forceClose(); }
-  else { log("  [" + filter + "] WARNING: rejection_high introuvable"); }
+  // Sauvegarder puis fermer — allowOverwrite=true pour écrasement propre
+  if (highWin) {
+    var okH = highWin.saveAs(pathHigh, false, true, false, false);
+    highWin.forceClose();
+    if (okH) log("  [" + filter + "] Rejection high saved : " + pathHigh);
+    else     log("  [" + filter + "] ERROR: saveAs rejection_high a échoué (id=" + highWin.mainView.id + ")");
+  } else { log("  [" + filter + "] WARNING: rejection_high introuvable"); }
 
-  if (lowWin)  { lowWin.saveAs(pathLow,   false, false, false, false); lowWin.forceClose();  }
-  else { log("  [" + filter + "] WARNING: rejection_low introuvable"); }
+  if (lowWin) {
+    var okL = lowWin.saveAs(pathLow, false, true, false, false);
+    lowWin.forceClose();
+    if (okL) log("  [" + filter + "] Rejection low  saved : " + pathLow);
+    else     log("  [" + filter + "] ERROR: saveAs rejection_low a échoué (id=" + lowWin.mainView.id + ")");
+  } else { log("  [" + filter + "] WARNING: rejection_low introuvable"); }
 
-  if (intWin)  { intWin.saveAs(outPath,   false, false, false, false); intWin.forceClose();  }
-  else { log("  [" + filter + "] WARNING: integration introuvable"); }
+  if (intWin) {
+    var okI = intWin.saveAs(outPath, false, true, false, false);
+    intWin.forceClose();
+    if (okI) log("  [" + filter + "] Integration saved    : " + outPath);
+    else     log("  [" + filter + "] ERROR: saveAs integration a échoué (id=" + intWin.mainView.id + ")");
+  } else { log("  [" + filter + "] WARNING: integration introuvable"); }
 
   closeAllWindows();
-
-  if (intWin)  { log("  [" + filter + "] Integration saved    : " + outPath); }
-  if (highWin) { log("  [" + filter + "] Rejection high saved : " + pathHigh); }
-  if (lowWin)  { log("  [" + filter + "] Rejection low  saved : " + pathLow); }
 }
 
 // ============================================================
