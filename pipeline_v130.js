@@ -1,10 +1,21 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.5.2
+// Version: 1.5.3
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.5.3 vs v1.5.2 :
+//   - BUG FIXÉ (ABE) : collect-first/close-second — ImageWindow.windows est une
+//     collection live, fermer pendant l'itération décalait les indices → fenêtres non fermées
+//   - BUG FIXÉ (probes + final) : détection fenêtres par POSITION EXCLUSIVE (0=intégration,
+//     1=rejected_high, 2=rejected_low). L'ancienne détection par nom "high"/"low" échouait
+//     car Pix nomme les fenêtres "integration_1", "integration_2" (sans high/low)
+//     → highWin/lowWin restaient null → rejRate toujours 0%
+//   - BUG FIXÉ (rejRate) : image.mean() sans /nImg — rejection maps Pix sont float32
+//     avec valeurs = fraction directe (0..1), pas des comptes entiers
+//   - BUG FIXÉ (cleanup final int) : même pattern collect-first que ABE
 //
 // Nouveautés v1.5.2 vs v1.5.1 :
 //   - BUG FIXÉ : rejection maps finale détectées par snapshot avant/après executeGlobal
@@ -631,12 +642,16 @@ function runABE(filter) {
     // processEvents + gc : force PixInsight à finaliser la création des
     // fenêtres background AVANT qu'on tente de les détecter (création asynchrone)
     processEvents(); gc();
-    // Fermer TOUTES les nouvelles fenêtres créées par ABE (background model)
-    // win.mainView.id est dans idsBefore → il ne sera pas fermé
-    var winsAfter = ImageWindow.windows;
-    for (var wi = winsAfter.length - 1; wi >= 0; wi--) {
-      if (!idsBefore[winsAfter[wi].mainView.id]) winsAfter[wi].forceClose();
+    // Fermer TOUTES les nouvelles fenêtres créées par ABE (background model).
+    // 1. Snapshot IMMUTABLE d'abord (ImageWindow.windows est une collection live —
+    //    forceClose() pendant l'itération décalerait les indices)
+    // 2. Fermeture ensuite sur la liste figée
+    var toCloseABE = [];
+    var winsAfterABE = ImageWindow.windows;
+    for (var wai = 0; wai < winsAfterABE.length; wai++) {
+      if (!idsBefore[winsAfterABE[wai].mainView.id]) toCloseABE.push(winsAfterABE[wai]);
     }
+    for (var ci = 0; ci < toCloseABE.length; ci++) toCloseABE[ci].forceClose();
 
     win.saveAs(outPath, false, false, false, false);
     win.forceClose();
@@ -1023,28 +1038,22 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
   // asynchrone — sans processEvents() elles peuvent être absentes du snapshot
   processEvents(); gc();
 
-  // Identifier UNIQUEMENT les nouvelles fenêtres créées par cette exécution.
-  // Stratégie : name-based EN PREMIER, puis fallback positionnel (ordre de création
-  // PixInsight : integration → rejected_high → rejected_low).
-  var intWin  = null;
-  var highWin = null;
-  var lowWin  = null;
+  // Identifier les nouvelles fenêtres créées par cette exécution.
+  // STRATÉGIE POSITIONNELLE EXCLUSIVE : PixInsight crée toujours dans l'ordre
+  //   [0] = image intégrée
+  //   [1] = rejection map high
+  //   [2] = rejection map low
+  // La détection par nom échoue car Pix nomme les fenêtres "integration_1",
+  // "integration_2", etc. (sans "high"/"low") → on ne se fie qu'à la position.
+  // Snapshot immutable avant toute fermeture.
   var probeNewWins = [];
   var winsAfterProbe = ImageWindow.windows;
-  for (var w = 0; w < winsAfterProbe.length; w++) {
-    var pw = winsAfterProbe[w];
-    if (idsBeforeProbe[pw.mainView.id]) continue;  // fenêtre pré-existante
-    probeNewWins.push(pw);
-    var vid = pw.mainView.id.toLowerCase();
-    // PixInsight peut nommer "rejected_high", "high", "rej_high"… → chercher "high"/"low"
-    if      (vid.indexOf("high") >= 0) { highWin = pw; }
-    else if (vid.indexOf("low")  >= 0) { lowWin  = pw; }
-    else                               { intWin  = pw; }
+  for (var wpi = 0; wpi < winsAfterProbe.length; wpi++) {
+    if (!idsBeforeProbe[winsAfterProbe[wpi].mainView.id]) probeNewWins.push(winsAfterProbe[wpi]);
   }
-  // Fallback positionnel si name-based n'a rien trouvé
-  if (probeNewWins.length >= 1 && intWin  === null) intWin  = probeNewWins[0];
-  if (probeNewWins.length >= 2 && highWin === null) highWin = probeNewWins[1];
-  if (probeNewWins.length >= 3 && lowWin  === null) lowWin  = probeNewWins[2];
+  var intWin  = probeNewWins.length >= 1 ? probeNewWins[0] : null;
+  var highWin = probeNewWins.length >= 2 ? probeNewWins[1] : null;
+  var lowWin  = probeNewWins.length >= 3 ? probeNewWins[2] : null;
 
   // MAD du stack (channel 0)
   if (intWin !== null) {
@@ -1052,15 +1061,14 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
     catch(e) { result.mad = 999999; }
   }
 
-  // Taux de rejet : mean de la rejection map divisé par nImages
-  // (PixInsight stocke les comptes 0..N, pas des fractions)
-  var nImg = images.length || 1;
+  // Taux de rejet : les rejection maps PixInsight sont des images float32 avec
+  // des valeurs pixel = fraction rejetée (0..1 directement, sans division par nImages)
   if (highWin !== null) {
-    try { result.rejRateHigh = highWin.mainView.image.mean(0) / nImg; }
+    try { result.rejRateHigh = highWin.mainView.image.mean(); }
     catch(e) { result.rejRateHigh = 0; }
   }
   if (lowWin !== null) {
-    try { result.rejRateLow = lowWin.mainView.image.mean(0) / nImg; }
+    try { result.rejRateLow = lowWin.mainView.image.mean(); }
     catch(e) { result.rejRateLow = 0; }
   }
 
@@ -1306,7 +1314,8 @@ function runIntegration(filter) {
   var pathHigh = CONFIG.resultDir + "/" + filter + "_rejection_high.xisf";
   var pathLow  = CONFIG.resultDir + "/" + filter + "_rejection_low.xisf";
 
-  // Identifier uniquement les nouvelles fenêtres créées par cette intégration
+  // Identifier uniquement les nouvelles fenêtres créées par cette intégration.
+  // Même stratégie positionnelle que probeIntegration (voir commentaire là-bas).
   var allWinsAfterInt = ImageWindow.windows;
   var intNewWins = [];
   var allIds = [];
@@ -1314,20 +1323,12 @@ function runIntegration(filter) {
     allIds.push(allWinsAfterInt[wi].mainView.id);
     if (!idsBeforeInt[allWinsAfterInt[wi].mainView.id]) intNewWins.push(allWinsAfterInt[wi]);
   }
-  log("  [" + filter + "] Fenêtres ouvertes après Integration: [" + allIds.join(", ") + "]");
+  log("  [" + filter + "] Nouvelles fenêtres après Integration (" + intNewWins.length + "): [" + allIds.join(", ") + "]");
 
-  var intWin  = null, highWin = null, lowWin = null;
-  for (var w = 0; w < intNewWins.length; w++) {
-    var fw = intNewWins[w];
-    var vid = fw.mainView.id.toLowerCase();
-    if      (vid.indexOf("high") >= 0) { highWin = fw; }
-    else if (vid.indexOf("low")  >= 0) { lowWin  = fw; }
-    else                               { intWin  = fw; }
-  }
-  // Fallback positionnel
-  if (intNewWins.length >= 1 && intWin  === null) intWin  = intNewWins[0];
-  if (intNewWins.length >= 2 && highWin === null) highWin = intNewWins[1];
-  if (intNewWins.length >= 3 && lowWin  === null) lowWin  = intNewWins[2];
+  // Ordre de création Pix : [0]=intégration, [1]=rejected_high, [2]=rejected_low
+  var intWin  = intNewWins.length >= 1 ? intNewWins[0] : null;
+  var highWin = intNewWins.length >= 2 ? intNewWins[1] : null;
+  var lowWin  = intNewWins.length >= 3 ? intNewWins[2] : null;
 
   // Sauvegarder puis fermer — allowOverwrite=true pour écrasement propre
   if (highWin) {
@@ -1351,11 +1352,13 @@ function runIntegration(filter) {
     else     log("  [" + filter + "] ERROR: saveAs integration a échoué (id=" + intWin.mainView.id + ")");
   } else { log("  [" + filter + "] WARNING: integration introuvable"); }
 
-  // Fermer uniquement les fenêtres résiduelles de cette intégration (pas closeAllWindows)
-  var remaining = ImageWindow.windows;
-  for (var rw = remaining.length - 1; rw >= 0; rw--) {
-    if (!idsBeforeInt[remaining[rw].mainView.id]) remaining[rw].forceClose();
+  // Fermer uniquement les fenêtres résiduelles (collect-first, même raison que ABE)
+  var toCloseInt = [];
+  var remainingInt = ImageWindow.windows;
+  for (var rw = 0; rw < remainingInt.length; rw++) {
+    if (!idsBeforeInt[remainingInt[rw].mainView.id]) toCloseInt.push(remainingInt[rw]);
   }
+  for (var rc = 0; rc < toCloseInt.length; rc++) toCloseInt[rc].forceClose();
 }
 
 // ============================================================
