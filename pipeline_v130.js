@@ -1,6 +1,6 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.6.5
+// Version: 1.6.6
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
@@ -1448,18 +1448,125 @@ function findOptimalSigma(filter, images) {
     }
   }
 
-  // Sélection finale : meilleur score tous probes confondus
+  // Sélection finale Phase A : meilleur score tous probes confondus
   for (var ki = 0; ki < journal.length; ki++) {
     if (journal[ki].score < bestEntry.score) bestEntry = journal[ki];
   }
 
-  return buildResult(filter, bestEntry, journal, images.length, mode,
-                     targetHigh, highTol, maxLow);
+  // ============================================================
+  // PHASE B : bisection sur linearFitLow → cible rejLow
+  // sH fixé au résultat de Phase A — même mécanique que Phase A
+  // ============================================================
+  var targetLow = (CONFIG.autoSigmaTargetLow !== undefined) ? CONFIG.autoSigmaTargetLow : targetHigh;
+  var lowTolB   = (CONFIG.autoSigmaLowTol    !== undefined) ? CONFIG.autoSigmaLowTol    : highTol;
+  var foundSH_A = bestEntry.sH;
+  var SL_MIN_B  = 0.5, SL_MAX_B = 10.0;
+
+  log("  [" + filter + "] ── Phase B : bisection linearFitLow" +
+      " | cible rejLow=" + targetLow + "% ±" + lowTolB + "%" +
+      " | sH fixé=" + foundSH_A.toFixed(3) + " ──");
+
+  // Probe Phase B : varie sL, fixe sH
+  function runProbeL(sL) {
+    sL = Math.round(Math.min(SL_MAX_B, Math.max(SL_MIN_B, sL)) * 1000) / 1000;
+    nProbe++;
+    writeStatus("AUTOSIGMA_" + filter, "PROBE_B" + nProbe,
+      { probe: nProbe, sH: foundSH_A, sL: sL, phase: "B", maxIter: maxIter });
+    var r  = probeIntegration(images, sL, foundSH_A, saveInfo);
+    var rH = r.rejRateHigh * 100;
+    var rL = r.rejRateLow  * 100;
+    var gL = rL - targetLow;
+    var okB = (Math.abs(gL) <= lowTolB);
+    var entry = { iter: nProbe, sL: sL, sH: foundSH_A,
+                  rH: rH, rL: rL, score: Math.abs(gL),
+                  gap: bestEntry.gap, gapL: gL, ok: okB, phase: "B" };
+    journal.push(entry);
+    log("  [" + filter + "] B#" + nProbe +
+        "  sL=" + sL.toFixed(3) + " sH=" + foundSH_A.toFixed(3) +
+        "  rejH=" + rH.toFixed(4) + "% rejL=" + rL.toFixed(4) + "%" +
+        "  gapL=" + (gL >= 0 ? "+" : "") + gL.toFixed(4) + "%" +
+        (okB ? "  ✓ CIBLE" : ""));
+    return entry;
+  }
+
+  // Calibration Phase B : 6 probes couvrant toute la plage sL
+  var calSL_B = [0.5, 2.0, 4.0, 6.1, 8.0, 10.0];
+  var calResultsB = [], bestEntryB = null;
+  for (var cbi = 0; cbi < calSL_B.length; cbi++) {
+    var cbe = runProbeL(calSL_B[cbi]);
+    calResultsB.push(cbe);
+    if (cbe.ok) { bestEntryB = cbe; break; }
+  }
+
+  if (bestEntryB === null) {
+    // Vérifier si plancher rejLow (même à sL=10, rejLow > target)
+    var minRLentry = calResultsB[0], floorBL = true;
+    for (var fbi = 0; fbi < calResultsB.length; fbi++) {
+      if (calResultsB[fbi].rL < minRLentry.rL) minRLentry = calResultsB[fbi];
+      if (calResultsB[fbi].rL <= targetLow + lowTolB) floorBL = false;
+    }
+    if (floorBL) {
+      log("  [" + filter + "] ⚠ Phase B : plancher rejLow — sL max retenu (min rejLow)");
+      bestEntryB = minRLentry;
+    } else {
+      // Bisection Phase B : même logique que Phase A
+      var bsLoB = SL_MIN_B, bsHiB = SL_MAX_B;
+      for (var jbi = 0; jbi < calResultsB.length; jbi++) {
+        var jbe = calResultsB[jbi];
+        if (jbe.rL > targetLow && jbe.sL > bsLoB) bsLoB = jbe.sL;
+        if (jbe.rL < targetLow && jbe.sL < bsHiB) bsHiB = jbe.sL;
+      }
+      if (bsLoB >= bsHiB) { bsLoB = SL_MIN_B; bsHiB = SL_MAX_B; }
+      log("  [" + filter + "] Phase B bornes : sL ∈ [" +
+          bsLoB.toFixed(3) + ", " + bsHiB.toFixed(3) + "]");
+
+      bestEntryB = calResultsB[0];
+      for (var jb = 0; jb < calResultsB.length; jb++) {
+        if (Math.abs(calResultsB[jb].rL - targetLow) < Math.abs(bestEntryB.rL - targetLow))
+          bestEntryB = calResultsB[jb];
+      }
+      var bisMaxB = Math.max(0, maxIter - journal.length);
+      for (var bbi = 0; bbi < bisMaxB; bbi++) {
+        var sLMid = (bsLoB + bsHiB) / 2.0;
+        var bbe   = runProbeL(sLMid);
+        if (Math.abs(bbe.rL - targetLow) < Math.abs(bestEntryB.rL - targetLow)) bestEntryB = bbe;
+        if (bbe.ok) { log("  [" + filter + "] Phase B cible atteinte"); break; }
+        if (bbe.rL > targetLow) bsLoB = sLMid; else bsHiB = sLMid;
+        log("  [" + filter + "]   Phase B bornes : [" +
+            bsLoB.toFixed(4) + ", " + bsHiB.toFixed(4) + "]");
+        if ((bsHiB - bsLoB) < 0.0005) {
+          log("  [" + filter + "] Phase B convergence numérique"); break;
+        }
+      }
+    }
+  }
+
+  // Résultat final : sH de Phase A + sL de Phase B
+  var finalEntry = {
+    iter:          bestEntryB.iter,
+    sL:            bestEntryB.sL,
+    sH:            foundSH_A,
+    rH:            bestEntryB.rH,
+    rL:            bestEntryB.rL,
+    score:         bestEntry.score + Math.abs(bestEntryB.rL - targetLow),
+    gap:           bestEntry.gap,
+    gapL:          bestEntryB.gapL,
+    ok:            bestEntryB.ok,
+    phaseAok:      (bestEntry.ok || bestEntry.floorDetected === true),
+    phaseBok:      bestEntryB.ok,
+    floorDetected: bestEntry.floorDetected || false,
+    floorValue:    bestEntry.floorValue    || null
+  };
+
+  return buildResult(filter, finalEntry, journal, images.length, mode,
+                     targetHigh, highTol, maxLow, targetLow, lowTolB);
 }
 
 // Construit le résultat final : rapport console + JSON sigma_search
 function buildResult(filter, best, journal, nImages, mode,
-                     targetHigh, highTol, maxLow) {
+                     targetHigh, highTol, maxLow, targetLow, lowTolB) {
+  if (targetLow  === undefined) targetLow  = targetHigh;
+  if (lowTolB    === undefined) lowTolB    = highTol;
   log("  [" + filter + "] ── RÉSULTAT AUTOSIGMA v2 ────────────────────────");
   log("  [" + filter + "]   Mode " + mode +
       " | sigmaLow=" + best.sL.toFixed(3) +
@@ -1468,17 +1575,22 @@ function buildResult(filter, best, journal, nImages, mode,
       "  rejLow=" + best.rL.toFixed(4) + "%" +
       "  score=" + best.score.toFixed(6));
   var isFloorResult = (best.floorDetected === true);
-  if (best.ok) {
-    log("  [" + filter + "]   ✓ CIBLE ATTEINTE  rejHigh ∈ [" +
-        (targetHigh - highTol).toFixed(2) + "%, " +
-        (targetHigh + highTol).toFixed(2) + "%]");
-  } else if (isFloorResult) {
-    log("  [" + filter + "]   ✓ GENOU PLANCHER  rHfloor=" +
-        best.floorValue.toFixed(4) + "%" +
-        "  sigma optimal (min sH satisfaisant rejLow ≤ " + maxLow + "%)");
+  var phaseAok = (best.phaseAok !== undefined) ? best.phaseAok : best.ok;
+  var phaseBok = (best.phaseBok !== undefined) ? best.phaseBok : true;
+  if (phaseAok) {
+    log("  [" + filter + "]   ✓ Phase A : rejHigh=" + best.rH.toFixed(4) +
+        "% ∈ [" + (targetHigh-highTol).toFixed(2) + "%, " + (targetHigh+highTol).toFixed(2) + "%]" +
+        (isFloorResult ? "  (plancher rHfloor=" + (best.floorValue||0).toFixed(4) + "%)" : ""));
   } else {
-    log("  [" + filter + "]   ⚠ HORS CIBLE — meilleur résultat retenu" +
-        " (gap=" + (best.gap >= 0 ? "+" : "") + best.gap.toFixed(4) + "%)");
+    log("  [" + filter + "]   ⚠ Phase A hors cible" +
+        " (gap=" + (best.gap >= 0 ? "+" : "") + (best.gap||0).toFixed(4) + "%)");
+  }
+  if (phaseBok) {
+    log("  [" + filter + "]   ✓ Phase B : rejLow=" + best.rL.toFixed(4) +
+        "% ∈ [" + (targetLow-lowTolB).toFixed(2) + "%, " + (targetLow+lowTolB).toFixed(2) + "%]");
+  } else {
+    log("  [" + filter + "]   ⚠ Phase B hors cible" +
+        " (gapL=" + (best.gapL >= 0 ? "+" : "") + (best.gapL||0).toFixed(4) + "%)");
   }
   log("  [" + filter + "]   " + journal.length + " probes au total");
   log("  [" + filter + "]   Journal :");
@@ -1496,25 +1608,30 @@ function buildResult(filter, best, journal, nImages, mode,
   // converged = true si cible atteinte OU si genou plancher trouvé
   var isConverged = best.ok || isFloorResult;
 
+  var isConvergedB = phaseBok;
   var searchData = {
-    filter:        filter,
-    ts:            (new Date()).toISOString(),
-    algorithm:     "targeted-bisection-rejHigh v2.1.0",
-    mode:          mode,
-    targetHigh:    targetHigh,
-    highTol:       highTol,
-    maxLow:        maxLow,
-    nImages:       nImages,
-    nProbes:       journal.length,
-    converged:     isConverged,
-    floorDetected: isFloorResult,
-    floorValue:    isFloorResult ? best.floorValue : null,
-    sigmaLow:      best.sL,
-    sigmaHigh:     best.sH,
-    rejHighPct:    best.rH,
-    rejLowPct:     best.rL,
-    score:         best.score,
-    journal:       journal
+    filter:          filter,
+    ts:              (new Date()).toISOString(),
+    algorithm:       "targeted-bisection-rejHigh-rejLow v2.2.0",
+    mode:            mode,
+    targetHigh:      targetHigh,
+    highTol:         highTol,
+    targetLow:       targetLow,
+    lowTol:          lowTolB,
+    maxLow:          maxLow,
+    nImages:         nImages,
+    nProbes:         journal.length,
+    converged:       isConverged && isConvergedB,
+    phaseA_converged: phaseAok,
+    phaseB_converged: isConvergedB,
+    floorDetected:   isFloorResult,
+    floorValue:      isFloorResult ? best.floorValue : null,
+    sigmaLow:        best.sL,
+    sigmaHigh:       best.sH,
+    rejHighPct:      best.rH,
+    rejLowPct:       best.rL,
+    score:           best.score,
+    journal:         journal
   };
   writeJSON(CONFIG.resultDir + "/" + filter + "_sigma_search.json", searchData);
   log("  [" + filter + "] Sigma search JSON : " +
