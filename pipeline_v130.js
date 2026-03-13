@@ -1,10 +1,28 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.5.3
+// Version: 1.6.0
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
 //        (ne jamais copier le code inline - risque d'erreurs silencieuses)
+//
+// Nouveautés v1.6.0 vs v1.5.3 :
+//   - AUTOSIGMA v2 : bisection ciblée sur rejectionHighPercent
+//     Remplace la descente de coordonnées + minimisation MAD
+//     Cible : rejHighPct = CONFIG.autoSigmaTargetHigh (défaut 0.05%)
+//             tolérance ±CONFIG.autoSigmaHighTol (défaut 0.01%)
+//     Contrainte : rejLowPct < CONFIG.autoSigmaMaxLow (défaut 2.0%)
+//     Score : wH * |rejHigh - target| + wL * max(0, rejLow - maxLow)
+//             avec wH (défaut 10) >> wL (défaut 1)
+//     Mode A (défaut) : sigmaLow = 4.0 fixé, bisection sur sigmaHigh
+//     Mode B          : sigmaLow = sigmaHigh + 1, bisection sur sigmaHigh
+//     Phase 1 : 5 probes de calibration (sH = 2.0, 2.5, 3.0, 3.5, 4.0)
+//     Phase 2 : bisection adaptative — convergence garantie si la cible
+//               est atteignable dans [SH_MIN=1.0, SH_MAX=7.0]
+//   - buildResult() : nouvelle fonction utilitaire (rapport + JSON sigma_search)
+//   - Nouveaux paramètres CONFIG : autoSigmaMode, autoSigmaTargetHigh,
+//     autoSigmaHighTol, autoSigmaMaxLow, autoSigmaWH, autoSigmaWL, autoSigmaMaxIter
+//   - Anciens paramètres CONFIG supprimés : autoSigmaHighRange, autoSigmaLowRange
 //
 // Nouveautés v1.5.3 vs v1.5.2 :
 //   - BUG FIXÉ (ABE) : collect-first/close-second — ImageWindow.windows est une
@@ -1099,143 +1117,253 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
 // Phase B : balaye autoSigmaLowRange  (sigmaHigh fixe = meilleur de la Phase A)
 // Retourne { sigmaLow, sigmaHigh, sweepHigh, sweepLow }
 function findOptimalSigma(filter, images) {
-  var highRange = CONFIG.autoSigmaHighRange;
-  var lowRange  = CONFIG.autoSigmaLowRange;
+  // ============================================================
+  // AUTOSIGMA v2 — bisection ciblée sur rejectionHighPercent
+  // ============================================================
+  // Objectif   : amener rejHighPct vers CONFIG.autoSigmaTargetHigh (défaut 0.05%)
+  //              dans la tolérance ±CONFIG.autoSigmaHighTol (défaut 0.01%)
+  // Contrainte : rejLowPct ≤ CONFIG.autoSigmaMaxLow (défaut 2.0%)
+  //
+  // Relation exploitée : ↑sigmaHigh → ↓rejHigh (monotone décroissante)
+  //   → bisection garantie si la cible est dans la plage [SH_MIN, SH_MAX]
+  //
+  // Mode A (défaut) : sigmaLow = 4.0 fixé, bisection sur sigmaHigh seul
+  // Mode B          : sigmaLow = sigmaHigh + 1, bisection sur sigmaHigh
+  //
+  // Score (sélection best-of-all, NON utilisé pour la décision bisection) :
+  //   score = wH * |rejHigh - targetHigh| + wL * max(0, rejLow - maxLow)
+  //   avec wH (défaut 10) >> wL (défaut 1)
+  //   → rejHigh est le pilote, rejLow est une contrainte secondaire
+  // ============================================================
 
-  // saveInfo passé à probeIntegration si CONFIG.saveProbes est activé
-  var saveInfo = (CONFIG.saveProbes)
-    ? { dir: CONFIG.resultDir + "/probes", filter: filter }
-    : null;
+  // ---- Paramètres depuis CONFIG ----
+  var targetHigh = (typeof CONFIG.autoSigmaTargetHigh !== 'undefined') ? CONFIG.autoSigmaTargetHigh : 0.05;
+  var highTol    = (typeof CONFIG.autoSigmaHighTol    !== 'undefined') ? CONFIG.autoSigmaHighTol    : 0.01;
+  var maxLow     = (typeof CONFIG.autoSigmaMaxLow     !== 'undefined') ? CONFIG.autoSigmaMaxLow     : 2.0;
+  var wH         = (typeof CONFIG.autoSigmaWH         !== 'undefined') ? CONFIG.autoSigmaWH         : 10.0;
+  var wL         = (typeof CONFIG.autoSigmaWL         !== 'undefined') ? CONFIG.autoSigmaWL         : 1.0;
+  var maxIter    = (typeof CONFIG.autoSigmaMaxIter    !== 'undefined') ? CONFIG.autoSigmaMaxIter    : 15;
+  var mode       = (typeof CONFIG.autoSigmaMode       !== 'undefined') ? CONFIG.autoSigmaMode       : "A";
+  var SL_FIXED   = 4.0;   // sigmaLow fixé en mode A
+  var SH_INIT    = 3.0;   // centre des probes de calibration
+  var SH_MIN     = 1.0;   // borne absolue basse
+  var SH_MAX     = 7.0;   // borne absolue haute
 
-  // Guard : plages vides → fallback sur valeurs fixes
-  if (!highRange || highRange.length === 0 ||
-      !lowRange  || lowRange.length  === 0) {
-    log("  [" + filter + "] AUTOSIGMA: plages vides — sigma fixe utilisé");
-    return { sigmaLow: CONFIG.sigmaLow, sigmaHigh: CONFIG.sigmaHigh,
+  // ---- Validation ----
+  if (images.length === 0) {
+    log("  [" + filter + "] AUTOSIGMA v2 : aucune image — sigma fixe utilisé");
+    return { sigmaLow:  CONFIG.sigmaLow  || SL_FIXED,
+             sigmaHigh: CONFIG.sigmaHigh || SH_INIT,
              sweepHigh: [], sweepLow: [] };
   }
+  if (mode !== "A" && mode !== "B") {
+    log("  [" + filter + "] AUTOSIGMA v2 : mode '" + mode + "' inconnu → A par défaut");
+    mode = "A";
+  }
 
-  var sigmaLow_init = lowRange[Math.floor(lowRange.length / 2)];
-  var totalProbes   = highRange.length + lowRange.length;
+  log("  [" + filter + "] AUTOSIGMA v2 — Mode " + mode +
+      " | cible rejHigh=" + targetHigh + "% ±" + highTol + "%" +
+      " | maxRejLow=" + maxLow + "% | wH=" + wH + " wL=" + wL +
+      " | maxIter=" + maxIter);
 
-  log("  [" + filter + "] AUTOSIGMA Phase A — balayage sigmaHigh " +
-    "[" + highRange.join(", ") + "] (sigmaLow fixe=" + sigmaLow_init + ")");
+  var saveInfo = CONFIG.saveProbes
+    ? { dir: CONFIG.resultDir + "/probes", filter: filter }
+    : null;
+  var journal = [];
+  var nProbe  = 0;
 
-  // ---- Phase A : balayage sigmaHigh ----
-  var sweepHigh    = [];
-  var bestHighMAD  = 999999;
-  var bestSigmaHigh = highRange[0];
+  // ---- Helpers internes ----
 
-  for (var hi = 0; hi < highRange.length; hi++) {
-    var sigH = highRange[hi];
-    writeStatus("AUTOSIGMA_" + filter, "SWEEP_HIGH_" + sigH,
-      { probe: hi + 1, total: totalProbes });
+  // sigmaLow selon le mode
+  function slForSH(sH) {
+    return (mode === "B") ? (sH + 1.0) : SL_FIXED;
+  }
 
-    var r = probeIntegration(images, sigmaLow_init, sigH, saveInfo);
+  // Score : priorité forte au contrôle rejHigh, contrainte secondaire rejLow
+  // JAMAIS de moyenne simple (low+high)/2 — wH >> wL garantit la hiérarchie
+  function computeScore(rH, rL) {
+    var penH = Math.abs(rH - targetHigh);
+    var penL = (rL > maxLow) ? (rL - maxLow) : 0.0;
+    return wH * penH + wL * penL;
+  }
 
-    sweepHigh.push({
-      sigmaHigh:   sigH,
-      sigmaLow:    sigmaLow_init,
-      mad:         r.mad,
-      rejRateHigh: r.rejRateHigh,
-      rejRateLow:  r.rejRateLow
-    });
+  // Lance un probe, journalise, retourne l'entrée
+  function runProbe(sH) {
+    // Arrondi 3 décimales + clamping
+    sH = Math.round(Math.min(SH_MAX, Math.max(SH_MIN, sH)) * 1000) / 1000;
+    var sL = Math.round(slForSH(sH) * 1000) / 1000;
+    nProbe++;
 
-    log("    sigmaHigh=" + sigH.toFixed(1) +
-      "  MAD=" + r.mad.toFixed(7) +
-      "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
-      "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
+    writeStatus("AUTOSIGMA_" + filter, "PROBE_" + nProbe,
+      { probe: nProbe, sH: sH, sL: sL, maxIter: maxIter });
 
-    if (r.mad < bestHighMAD) {
-      bestHighMAD   = r.mad;
-      bestSigmaHigh = sigH;
+    var r  = probeIntegration(images, sL, sH, saveInfo);
+    var rH = r.rejRateHigh * 100;  // fraction → %
+    var rL = r.rejRateLow  * 100;
+    var sc = computeScore(rH, rL);
+    var ok = (Math.abs(rH - targetHigh) <= highTol && rL <= maxLow);
+
+    var entry = { iter: nProbe, sL: sL, sH: sH,
+                  rH: rH, rL: rL, score: sc,
+                  gap: rH - targetHigh, ok: ok };
+    journal.push(entry);
+
+    log("  [" + filter + "] #" + nProbe +
+        "  sL=" + sL.toFixed(3) + " sH=" + sH.toFixed(3) +
+        "  rejH=" + rH.toFixed(4) + "% rejL=" + rL.toFixed(4) + "%" +
+        "  score=" + sc.toFixed(6) +
+        "  gap=" + (entry.gap >= 0 ? "+" : "") + entry.gap.toFixed(4) + "%" +
+        (ok ? "  ✓ CIBLE" : ""));
+    return entry;
+  }
+
+  // ============================================================
+  // PHASE 1 : 5 probes de calibration
+  // But : cartographier rejHigh(sH) et initialiser les bornes bisection
+  // Points sH = 2.0, 2.5, 3.0, 3.5, 4.0
+  // ============================================================
+  log("  [" + filter + "] ── Phase 1 : calibration (5 probes) ──");
+
+  var calSH = [2.0, 2.5, 3.0, 3.5, 4.0];
+  var calResults = [];
+  for (var ci = 0; ci < calSH.length; ci++) {
+    var ce = runProbe(calSH[ci]);
+    calResults.push(ce);
+    if (ce.ok) {
+      log("  [" + filter + "] Cible atteinte en phase calibration (probe #" + nProbe + ")");
+      return buildResult(filter, ce, journal, images.length, mode,
+                         targetHigh, highTol, maxLow);
     }
   }
 
-  log("  [" + filter + "] Phase A terminée — bestSigmaHigh=" +
-    bestSigmaHigh + " (MAD=" + bestHighMAD.toFixed(7) + ")");
+  // ============================================================
+  // PHASE 2 : bisection adaptative sur sigmaHigh
+  // ============================================================
+  // Propriété exploitée (monotonie) :
+  //   rejHigh(sH) est décroissante en sH
+  //   → si rejHigh > target : sH trop bas → bsLo = max(bsLo, sH)
+  //   → si rejHigh < target : sH trop grand → bsHi = min(bsHi, sH)
+  //
+  // Initialisation des bornes depuis les probes de calibration :
+  //   meilleur sH tel que rH > target  → borne basse (le plus grand sH trop bas)
+  //   meilleur sH tel que rH < target  → borne haute (le plus petit sH trop haut)
+  // ============================================================
+  log("  [" + filter + "] ── Phase 2 : bisection adaptative ──");
 
-  // ---- Phase B : balayage sigmaLow (sigmaHigh fixé) ----
-  log("  [" + filter + "] AUTOSIGMA Phase B — balayage sigmaLow " +
-    "[" + lowRange.join(", ") + "] (sigmaHigh fixe=" + bestSigmaHigh + ")");
+  var bsLo = SH_MIN, bsHi = SH_MAX;
+  for (var ji = 0; ji < calResults.length; ji++) {
+    var je = calResults[ji];
+    if (je.rH > targetHigh && je.sH > bsLo) bsLo = je.sH;
+    if (je.rH < targetHigh && je.sH < bsHi) bsHi = je.sH;
+  }
 
-  var sweepLow    = [];
-  var bestLowMAD  = 999999;
-  var bestSigmaLow = lowRange[0];
+  if (bsLo >= bsHi) {
+    // Cas dégénéré : tous les probes du même côté de la cible
+    log("  [" + filter + "] ⚠ Bornes invalides (bsLo=" + bsLo.toFixed(3) +
+        " ≥ bsHi=" + bsHi.toFixed(3) + ") → reset [" + SH_MIN + ", " + SH_MAX + "]");
+    bsLo = SH_MIN;
+    bsHi = SH_MAX;
+  } else {
+    log("  [" + filter + "] Bornes initiales : sH ∈ [" +
+        bsLo.toFixed(3) + ", " + bsHi.toFixed(3) + "]");
+  }
 
-  for (var li = 0; li < lowRange.length; li++) {
-    var sigL = lowRange[li];
-    writeStatus("AUTOSIGMA_" + filter, "SWEEP_LOW_" + sigL,
-      { probe: highRange.length + li + 1, total: totalProbes });
+  // Best courant = meilleur score des probes de calibration
+  var bestEntry = calResults[0];
+  for (var ki = 0; ki < calResults.length; ki++) {
+    if (calResults[ki].score < bestEntry.score) bestEntry = calResults[ki];
+  }
 
-    var r = probeIntegration(images, sigL, bestSigmaHigh, saveInfo);
+  var bisectMax = maxIter - calSH.length;
+  for (var bi = 0; bi < bisectMax; bi++) {
+    var sMid = (bsLo + bsHi) / 2.0;
+    var be   = runProbe(sMid);
+    if (be.score < bestEntry.score) bestEntry = be;
 
-    sweepLow.push({
-      sigmaHigh:   bestSigmaHigh,
-      sigmaLow:    sigL,
-      mad:         r.mad,
-      rejRateHigh: r.rejRateHigh,
-      rejRateLow:  r.rejRateLow
-    });
+    if (be.ok) {
+      log("  [" + filter + "] Cible atteinte (bisection #" + (bi + 1) + ")");
+      break;
+    }
 
-    log("    sigmaLow=" + sigL.toFixed(1) +
-      "  MAD=" + r.mad.toFixed(7) +
-      "  rejHigh=" + (r.rejRateHigh * 100).toFixed(2) + "%" +
-      "  rejLow="  + (r.rejRateLow  * 100).toFixed(2) + "%");
+    // Affiner les bornes selon la monotonie
+    if (be.rH > targetHigh) {
+      bsLo = sMid;  // rejHigh trop élevé → sH trop bas → remonter la borne basse
+    } else {
+      bsHi = sMid;  // rejHigh trop faible → sH trop haut → abaisser la borne haute
+    }
+    log("  [" + filter + "]   bornes : [" + bsLo.toFixed(4) + ", " + bsHi.toFixed(4) + "]");
 
-    if (r.mad < bestLowMAD) {
-      bestLowMAD   = r.mad;
-      bestSigmaLow = sigL;
+    if ((bsHi - bsLo) < 0.0005) {
+      log("  [" + filter + "] Convergence numérique (bsHi-bsLo=" +
+          (bsHi - bsLo).toFixed(5) + " < 0.0005)");
+      break;
     }
   }
 
-  log("  [" + filter + "] Phase B terminée — bestSigmaLow=" +
-    bestSigmaLow + " (MAD=" + bestLowMAD.toFixed(7) + ")");
-
-  // ---- Tableau récapitulatif console ----
-  log("  [" + filter + "] ── RÉSULTAT AUTOSIGMA ──────────────────");
-  log("  [" + filter + "]   sigmaLow=" + bestSigmaLow +
-    "  sigmaHigh=" + bestSigmaHigh);
-  log("  [" + filter + "]   Sweep High (" + sweepHigh.length + " probes) :");
-  for (var s = 0; s < sweepHigh.length; s++) {
-    var sw = sweepHigh[s];
-    var marker = (sw.sigmaHigh === bestSigmaHigh) ? "  ← BEST" : "";
-    log("  [" + filter + "]     sigmaHigh=" + sw.sigmaHigh.toFixed(1) +
-      "  MAD=" + sw.mad.toFixed(7) + marker);
+  // Sélection finale : meilleur score tous probes confondus
+  for (var ki = 0; ki < journal.length; ki++) {
+    if (journal[ki].score < bestEntry.score) bestEntry = journal[ki];
   }
-  log("  [" + filter + "]   Sweep Low (" + sweepLow.length + " probes) :");
-  for (var s = 0; s < sweepLow.length; s++) {
-    var sw = sweepLow[s];
-    var marker = (sw.sigmaLow === bestSigmaLow) ? "  ← BEST" : "";
-    log("  [" + filter + "]     sigmaLow=" + sw.sigmaLow.toFixed(1) +
-      "  MAD=" + sw.mad.toFixed(7) + marker);
-  }
-  log("  [" + filter + "] ────────────────────────────────────────");
 
-  // ---- Export JSON ----
+  return buildResult(filter, bestEntry, journal, images.length, mode,
+                     targetHigh, highTol, maxLow);
+}
+
+// Construit le résultat final : rapport console + JSON sigma_search
+function buildResult(filter, best, journal, nImages, mode,
+                     targetHigh, highTol, maxLow) {
+  log("  [" + filter + "] ── RÉSULTAT AUTOSIGMA v2 ────────────────────────");
+  log("  [" + filter + "]   Mode " + mode +
+      " | sigmaLow=" + best.sL.toFixed(3) +
+      "  sigmaHigh=" + best.sH.toFixed(3));
+  log("  [" + filter + "]   rejHigh=" + best.rH.toFixed(4) + "%" +
+      "  rejLow=" + best.rL.toFixed(4) + "%" +
+      "  score=" + best.score.toFixed(6));
+  if (best.ok) {
+    log("  [" + filter + "]   ✓ DANS CIBLE  rejHigh ∈ [" +
+        (targetHigh - highTol).toFixed(2) + "%, " +
+        (targetHigh + highTol).toFixed(2) + "%]");
+  } else {
+    log("  [" + filter + "]   ⚠ HORS CIBLE — meilleur résultat retenu" +
+        " (gap=" + (best.gap >= 0 ? "+" : "") + best.gap.toFixed(4) + "%)");
+  }
+  log("  [" + filter + "]   " + journal.length + " probes au total");
+  log("  [" + filter + "]   Journal :");
+  for (var j = 0; j < journal.length; j++) {
+    var e = journal[j];
+    var mk = (e.iter === best.iter) ? "  ← BEST" : "";
+    log("  [" + filter + "]     #" + e.iter +
+        "  sL=" + e.sL.toFixed(3) + " sH=" + e.sH.toFixed(3) +
+        "  rejH=" + e.rH.toFixed(4) + "% rejL=" + e.rL.toFixed(4) + "%" +
+        "  sc=" + e.score.toFixed(6) +
+        "  gap=" + (e.gap >= 0 ? "+" : "") + e.gap.toFixed(4) + "%" + mk);
+  }
+  log("  [" + filter + "] ─────────────────────────────────────────────────");
+
   var searchData = {
-    filter:        filter,
-    ts:            (new Date()).toISOString(),
-    algorithm:     "coordinate-descent-MAD v1.4.0",
-    nImages:       images.length,
-    sigmaLow_init: sigmaLow_init,
-    bestSigmaHigh: bestSigmaHigh,
-    bestSigmaLow:  bestSigmaLow,
-    bestMAD_High:  bestHighMAD,
-    bestMAD_Low:   bestLowMAD,
-    sweepHigh:     sweepHigh,
-    sweepLow:      sweepLow
+    filter:      filter,
+    ts:          (new Date()).toISOString(),
+    algorithm:   "targeted-bisection-rejHigh v2.0.0",
+    mode:        mode,
+    targetHigh:  targetHigh,
+    highTol:     highTol,
+    maxLow:      maxLow,
+    nImages:     nImages,
+    nProbes:     journal.length,
+    converged:   best.ok,
+    sigmaLow:    best.sL,
+    sigmaHigh:   best.sH,
+    rejHighPct:  best.rH,
+    rejLowPct:   best.rL,
+    score:       best.score,
+    journal:     journal
   };
   writeJSON(CONFIG.resultDir + "/" + filter + "_sigma_search.json", searchData);
-  log("  [" + filter + "] Sigma search JSON: " +
-    CONFIG.resultDir + "/" + filter + "_sigma_search.json");
+  log("  [" + filter + "] Sigma search JSON : " +
+      CONFIG.resultDir + "/" + filter + "_sigma_search.json");
 
-  return {
-    sigmaLow:  bestSigmaLow,
-    sigmaHigh: bestSigmaHigh,
-    sweepHigh: sweepHigh,
-    sweepLow:  sweepLow
-  };
+  return { sigmaLow:  best.sL, sigmaHigh: best.sH,
+           sweepHigh: journal, sweepLow:  [] };
 }
 
 // ============================================================
