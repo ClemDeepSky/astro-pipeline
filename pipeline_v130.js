@@ -1,6 +1,6 @@
 // ============================================================
 // ASTRO PIPELINE - Autonomous PixInsight Preprocessing
-// Version: 1.6.0
+// Version: 1.6.5
 // ============================================================
 //
 // USAGE: eval(File.readTextFile("C:/astro-pipeline/run_XXX.js"))
@@ -87,7 +87,7 @@ if (typeof CONFIG === 'undefined') var CONFIG = {
   doIntegration:     true,
   doDrizzle:         true,
 
-  // ImageIntegration - SigmaClip
+  // ImageIntegration - LinearFitClipping
   sigmaLow:          4.0,
   sigmaHigh:         3.0,
 
@@ -1041,10 +1041,10 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
   ii.weightScale            = ImageIntegration.prototype.WeightScale_BWMV;
   ii.minWeight              = 0.005;
   ii.normalization          = ImageIntegration.prototype.AdditiveWithScaling;
-  ii.rejection              = ImageIntegration.prototype.SigmaClip;
+  ii.rejection              = ImageIntegration.prototype.LinearFit;
   ii.rejectionNormalization = ImageIntegration.prototype.Scale;
-  ii.sigmaLow               = sigmaLow;
-  ii.sigmaHigh              = sigmaHigh;
+  ii.linearFitLow           = sigmaLow;
+  ii.linearFitHigh          = sigmaHigh;
   ii.clipLow                = true;
   ii.clipHigh               = true;
   ii.generateDrizzleData    = false;
@@ -1070,8 +1070,8 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
     if (!idsBeforeProbe[winsAfterProbe[wpi].mainView.id]) probeNewWins.push(winsAfterProbe[wpi]);
   }
   var intWin  = probeNewWins.length >= 1 ? probeNewWins[0] : null;
-  var highWin = probeNewWins.length >= 2 ? probeNewWins[1] : null;
-  var lowWin  = probeNewWins.length >= 3 ? probeNewWins[2] : null;
+  var lowWin  = probeNewWins.length >= 2 ? probeNewWins[1] : null; // PixInsight : LOW en premier
+  var highWin = probeNewWins.length >= 3 ? probeNewWins[2] : null; // puis HIGH en second
 
   // MAD du stack (channel 0)
   if (intWin !== null) {
@@ -1081,6 +1081,7 @@ function probeIntegration(images, sigmaLow, sigmaHigh, saveInfo) {
 
   // Taux de rejet : les rejection maps PixInsight sont des images float32 avec
   // des valeurs pixel = fraction rejetée (0..1 directement, sans division par nImages)
+  // Ordre création fenêtres : [0]=intégration  [1]=rejection_LOW  [2]=rejection_HIGH
   if (highWin !== null) {
     try { result.rejRateHigh = highWin.mainView.image.mean(); }
     catch(e) { result.rejRateHigh = 0; }
@@ -1144,10 +1145,10 @@ function findOptimalSigma(filter, images) {
   var wL         = (typeof CONFIG.autoSigmaWL         !== 'undefined') ? CONFIG.autoSigmaWL         : 1.0;
   var maxIter    = (typeof CONFIG.autoSigmaMaxIter    !== 'undefined') ? CONFIG.autoSigmaMaxIter    : 15;
   var mode       = (typeof CONFIG.autoSigmaMode       !== 'undefined') ? CONFIG.autoSigmaMode       : "A";
-  var SL_FIXED   = 4.0;   // sigmaLow fixé en mode A
+  var SL_FIXED   = 6.1;   // linearFitLow fixé en mode A (valeur validée manuellement)
   var SH_INIT    = 3.0;   // centre des probes de calibration
-  var SH_MIN     = 1.0;   // borne absolue basse
-  var SH_MAX     = 7.0;   // borne absolue haute
+  var SH_MIN     = 0.5;   // borne absolue basse
+  var SH_MAX     = 10.0;  // borne absolue haute — limite API PixInsight
 
   // ---- Validation ----
   if (images.length === 0) {
@@ -1218,13 +1219,16 @@ function findOptimalSigma(filter, images) {
   }
 
   // ============================================================
-  // PHASE 1 : 5 probes de calibration
-  // But : cartographier rejHigh(sH) et initialiser les bornes bisection
-  // Points sH = 2.0, 2.5, 3.0, 3.5, 4.0
+  // PHASE 1 : 8 probes de calibration — cartographie large de la courbe
+  // Points : [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0]
+  //   - 0.5–2.0 : zone basse (rejHigh encore variable, rejLow peut exploser)
+  //   - 3.0–5.0 : zone intermédiaire (plateau local possible)
+  //   - 10.0    : maximum autorisé par PixInsight — indispensable pour
+  //               confirmer si le plateau 3–5 est local ou définitif
   // ============================================================
-  log("  [" + filter + "] ── Phase 1 : calibration (5 probes) ──");
+  log("  [" + filter + "] ── Phase 1 : calibration (8 probes) ──");
 
-  var calSH = [2.0, 2.5, 3.0, 3.5, 4.0];
+  var calSH = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0];
   var calResults = [];
   for (var ci = 0; ci < calSH.length; ci++) {
     var ce = runProbe(calSH[ci]);
@@ -1234,6 +1238,139 @@ function findOptimalSigma(filter, images) {
       return buildResult(filter, ce, journal, images.length, mode,
                          targetHigh, highTol, maxLow);
     }
+  }
+
+  // ============================================================
+  // DÉTECTION DU PLANCHER — méthode dernier probe (fiable)
+  // ============================================================
+  // Le vrai plancher = si même au sigma le plus élevé testé (sH=20),
+  // rejHigh reste au-dessus de la cible → la cible est hors portée.
+  //
+  // IMPORTANT : ne pas se fier à un plateau LOCAL (sH=3–5) pour conclure
+  // au plancher — la courbe peut continuer de descendre à sH=10–20.
+  // Seul le dernier probe (sH le plus élevé) fait foi.
+  // ============================================================
+  var floorEps    = 0.01;
+  var lastCal     = calResults[calResults.length - 1]; // sH=20
+  var rHglobalMin = calResults[0].rH;
+  for (var fi = 1; fi < calResults.length; fi++) {
+    if (calResults[fi].rH < rHglobalMin) rHglobalMin = calResults[fi].rH;
+  }
+  var rHfloor = rHglobalMin;
+
+  // Plancher confirmé uniquement si le dernier probe (sigma max) est encore > cible
+  var isFloor = (lastCal.rH > targetHigh + highTol);
+
+  if (isFloor) {
+    log("  [" + filter + "] ⚠ PLANCHER DÉTECTÉ (sH=10 → rH=" + lastCal.rH.toFixed(4) + "% > cible)");
+    log("  [" + filter + "]   rHfloor=" + rHfloor.toFixed(4) + "%" +
+        "  (min global Phase 1)");
+    log("  [" + filter + "]   Cible " + targetHigh + "% inateignable (plancher physique)" +
+        " — recherche du sigma genou optimal");
+
+    // ============================================================
+    // PHASE 1.5 : RECHERCHE DU GENOU
+    // ============================================================
+    // Le "genou" = minimum sigmaHigh tel que SIMULTANÉMENT :
+    //   1) rH ≤ rHfloor + floorEps  (on est au plancher : cosmiques bien rejetés)
+    //   2) rL ≤ maxLow              (rejLow acceptable : pas de signal légitime perdu)
+    //
+    // On bisecte entre le dernier probe invalide et le premier probe valide
+    // de Phase 1 → trouve le sigma le plus bas satisfaisant les deux critères.
+    // ============================================================
+    log("  [" + filter + "] ── Phase 1.5 : recherche du genou ──");
+
+    // Trouver le bracket [kneeLoSH, kneeHiSH] dans les résultats Phase 1
+    var kneeLoSH = null, kneeHiSH = null;
+    for (var ki = 0; ki < calResults.length; ki++) {
+      var cr = calResults[ki];
+      var atFloor = (cr.rH <= rHfloor + floorEps);
+      var lowOk   = (cr.rL <= maxLow);
+      if (atFloor && lowOk) {
+        // Point valide → candidate borne haute du genou (on cherche le min sH valide)
+        if (kneeHiSH === null || cr.sH < kneeHiSH) kneeHiSH = cr.sH;
+      } else {
+        // Point invalide → candidate borne basse
+        if (kneeLoSH === null || cr.sH > kneeLoSH) kneeLoSH = cr.sH;
+      }
+    }
+
+    if (kneeHiSH === null) {
+      // Aucun point Phase 1 ne satisfait les deux critères → maxLow trop strict?
+      // Fallback : choisir le point avec le rejLow minimal (min dommage collatéral)
+      log("  [" + filter + "] ⚠ Aucun genou Phase 1 valide (maxLow=" + maxLow + "%" +
+          " trop strict?) → sigma max retenu (rejLow minimal)");
+      var fallback = calResults[0];
+      for (var fi = 1; fi < calResults.length; fi++) {
+        if (calResults[fi].rL < fallback.rL) fallback = calResults[fi];
+      }
+      fallback.floorDetected = true;
+      fallback.floorValue    = rHfloor;
+      return buildResult(filter, fallback, journal, images.length, mode,
+                         targetHigh, highTol, maxLow);
+    }
+
+    // Récupérer l'entrée Phase 1 correspondant à kneeHiSH (premier point valide)
+    var kneeHiEntry = null;
+    for (var ki = 0; ki < calResults.length; ki++) {
+      if (Math.abs(calResults[ki].sH - kneeHiSH) < 0.001) {
+        kneeHiEntry = calResults[ki]; break;
+      }
+    }
+
+    if (kneeLoSH === null || (kneeHiSH - kneeLoSH) < 0.1) {
+      // Bracket trop petit ou genou déjà au premier point → retourner directement
+      log("  [" + filter + "] Genou direct à sH=" + kneeHiSH.toFixed(3) +
+          " (pas de bisection nécessaire)");
+      kneeHiEntry.floorDetected = true;
+      kneeHiEntry.floorValue    = rHfloor;
+      return buildResult(filter, kneeHiEntry, journal, images.length, mode,
+                         targetHigh, highTol, maxLow);
+    }
+
+    log("  [" + filter + "] Bracket genou : [" + kneeLoSH.toFixed(3) +
+        ", " + kneeHiSH.toFixed(3) + "]" +
+        " (rejLow@lo=" + (function(){
+          for(var ki=0;ki<calResults.length;ki++) {
+            if(Math.abs(calResults[ki].sH-kneeLoSH)<0.001) return calResults[ki].rL.toFixed(2)+"%";
+          } return "?";
+        })() + ")");
+
+    // Bisection pour trouver le genou précis
+    var bestKneeEntry = kneeHiEntry; // meilleur connu = premier point valide Phase 1
+    var kneeMax = Math.min(5, maxIter - calSH.length);
+    for (var bi = 0; bi < kneeMax; bi++) {
+      if ((kneeHiSH - kneeLoSH) < 0.1) {
+        log("  [" + filter + "] Genou précis (bracket=" +
+            (kneeHiSH - kneeLoSH).toFixed(3) + " < 0.1) — arrêt");
+        break;
+      }
+      var sMid  = (kneeLoSH + kneeHiSH) / 2.0;
+      var ke    = runProbe(sMid);
+      var kAtF  = (ke.rH <= rHfloor + floorEps);
+      var kLowOk = (ke.rL <= maxLow);
+      if (kAtF && kLowOk) {
+        // Point valide → on peut descendre la borne haute
+        kneeHiSH     = sMid;
+        bestKneeEntry = ke; // nouveau meilleur (sH plus bas)
+        log("  [" + filter + "]   genou valide sH=" + sMid.toFixed(3) +
+            " → bracket [" + kneeLoSH.toFixed(3) + ", " + kneeHiSH.toFixed(3) + "]");
+      } else {
+        // Point invalide → monter la borne basse
+        kneeLoSH = sMid;
+        log("  [" + filter + "]   genou invalide sH=" + sMid.toFixed(3) +
+            " (rH=" + ke.rH.toFixed(4) + "% rL=" + ke.rL.toFixed(4) + "%)" +
+            " → bracket [" + kneeLoSH.toFixed(3) + ", " + kneeHiSH.toFixed(3) + "]");
+      }
+    }
+
+    log("  [" + filter + "] ✓ Genou optimal : sH=" + bestKneeEntry.sH.toFixed(3) +
+        "  rejH=" + bestKneeEntry.rH.toFixed(4) + "%" +
+        "  rejL=" + bestKneeEntry.rL.toFixed(4) + "%");
+    bestKneeEntry.floorDetected = true;
+    bestKneeEntry.floorValue    = rHfloor;
+    return buildResult(filter, bestKneeEntry, journal, images.length, mode,
+                       targetHigh, highTol, maxLow);
   }
 
   // ============================================================
@@ -1258,7 +1395,9 @@ function findOptimalSigma(filter, images) {
   }
 
   if (bsLo >= bsHi) {
-    // Cas dégénéré : tous les probes du même côté de la cible
+    // Cas dégénéré : tous les probes du même côté de la cible (sans plancher détecté)
+    // → la cible est dans la zone non couverte par la calibration
+    // → reset bornes larges
     log("  [" + filter + "] ⚠ Bornes invalides (bsLo=" + bsLo.toFixed(3) +
         " ≥ bsHi=" + bsHi.toFixed(3) + ") → reset [" + SH_MIN + ", " + SH_MAX + "]");
     bsLo = SH_MIN;
@@ -1274,6 +1413,7 @@ function findOptimalSigma(filter, images) {
     if (calResults[ki].score < bestEntry.score) bestEntry = calResults[ki];
   }
 
+  var prevRH    = null;  // détection de plancher pendant la bisection
   var bisectMax = maxIter - calSH.length;
   for (var bi = 0; bi < bisectMax; bi++) {
     var sMid = (bsLo + bsHi) / 2.0;
@@ -1284,6 +1424,14 @@ function findOptimalSigma(filter, images) {
       log("  [" + filter + "] Cible atteinte (bisection #" + (bi + 1) + ")");
       break;
     }
+
+    // Détection plancher pendant la bisection : rejHigh ne bouge plus
+    if (prevRH !== null && Math.abs(be.rH - prevRH) < floorEps && be.rH > targetHigh + highTol) {
+      log("  [" + filter + "] ⚠ Plancher détecté pendant bisection (#" + (bi + 1) +
+          ") — rejHigh figé à " + be.rH.toFixed(4) + "% → arrêt");
+      break;
+    }
+    prevRH = be.rH;
 
     // Affiner les bornes selon la monotonie
     if (be.rH > targetHigh) {
@@ -1319,10 +1467,15 @@ function buildResult(filter, best, journal, nImages, mode,
   log("  [" + filter + "]   rejHigh=" + best.rH.toFixed(4) + "%" +
       "  rejLow=" + best.rL.toFixed(4) + "%" +
       "  score=" + best.score.toFixed(6));
+  var isFloorResult = (best.floorDetected === true);
   if (best.ok) {
-    log("  [" + filter + "]   ✓ DANS CIBLE  rejHigh ∈ [" +
+    log("  [" + filter + "]   ✓ CIBLE ATTEINTE  rejHigh ∈ [" +
         (targetHigh - highTol).toFixed(2) + "%, " +
         (targetHigh + highTol).toFixed(2) + "%]");
+  } else if (isFloorResult) {
+    log("  [" + filter + "]   ✓ GENOU PLANCHER  rHfloor=" +
+        best.floorValue.toFixed(4) + "%" +
+        "  sigma optimal (min sH satisfaisant rejLow ≤ " + maxLow + "%)");
   } else {
     log("  [" + filter + "]   ⚠ HORS CIBLE — meilleur résultat retenu" +
         " (gap=" + (best.gap >= 0 ? "+" : "") + best.gap.toFixed(4) + "%)");
@@ -1340,23 +1493,28 @@ function buildResult(filter, best, journal, nImages, mode,
   }
   log("  [" + filter + "] ─────────────────────────────────────────────────");
 
+  // converged = true si cible atteinte OU si genou plancher trouvé
+  var isConverged = best.ok || isFloorResult;
+
   var searchData = {
-    filter:      filter,
-    ts:          (new Date()).toISOString(),
-    algorithm:   "targeted-bisection-rejHigh v2.0.0",
-    mode:        mode,
-    targetHigh:  targetHigh,
-    highTol:     highTol,
-    maxLow:      maxLow,
-    nImages:     nImages,
-    nProbes:     journal.length,
-    converged:   best.ok,
-    sigmaLow:    best.sL,
-    sigmaHigh:   best.sH,
-    rejHighPct:  best.rH,
-    rejLowPct:   best.rL,
-    score:       best.score,
-    journal:     journal
+    filter:        filter,
+    ts:            (new Date()).toISOString(),
+    algorithm:     "targeted-bisection-rejHigh v2.1.0",
+    mode:          mode,
+    targetHigh:    targetHigh,
+    highTol:       highTol,
+    maxLow:        maxLow,
+    nImages:       nImages,
+    nProbes:       journal.length,
+    converged:     isConverged,
+    floorDetected: isFloorResult,
+    floorValue:    isFloorResult ? best.floorValue : null,
+    sigmaLow:      best.sL,
+    sigmaHigh:     best.sH,
+    rejHighPct:    best.rH,
+    rejLowPct:     best.rL,
+    score:         best.score,
+    journal:       journal
   };
   writeJSON(CONFIG.resultDir + "/" + filter + "_sigma_search.json", searchData);
   log("  [" + filter + "] Sigma search JSON : " +
@@ -1420,10 +1578,10 @@ function runIntegration(filter) {
   ii.weightScale            = ImageIntegration.prototype.WeightScale_BWMV;
   ii.minWeight              = 0.005;
   ii.normalization          = ImageIntegration.prototype.AdditiveWithScaling;
-  ii.rejection              = ImageIntegration.prototype.SigmaClip;
+  ii.rejection              = ImageIntegration.prototype.LinearFit;
   ii.rejectionNormalization = ImageIntegration.prototype.Scale;
-  ii.sigmaLow               = useSigmaLow;
-  ii.sigmaHigh              = useSigmaHigh;
+  ii.linearFitLow           = useSigmaLow;
+  ii.linearFitHigh          = useSigmaHigh;
   ii.clipLow                = true;
   ii.clipHigh               = true;
   ii.generateDrizzleData    = true;
@@ -1453,10 +1611,10 @@ function runIntegration(filter) {
   }
   log("  [" + filter + "] Nouvelles fenêtres après Integration (" + intNewWins.length + "): [" + allIds.join(", ") + "]");
 
-  // Ordre de création Pix : [0]=intégration, [1]=rejected_high, [2]=rejected_low
+  // Ordre de création Pix : [0]=intégration, [1]=rejected_LOW, [2]=rejected_HIGH
   var intWin  = intNewWins.length >= 1 ? intNewWins[0] : null;
-  var highWin = intNewWins.length >= 2 ? intNewWins[1] : null;
-  var lowWin  = intNewWins.length >= 3 ? intNewWins[2] : null;
+  var lowWin  = intNewWins.length >= 2 ? intNewWins[1] : null;
+  var highWin = intNewWins.length >= 3 ? intNewWins[2] : null;
 
   // Sauvegarder puis fermer — allowOverwrite=true pour écrasement propre
   if (highWin) {
